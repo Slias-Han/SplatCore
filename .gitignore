@@ -39,3 +39,24 @@
 
 # debug information files
 *.dwo
+
+# Visual Studio and CMake generated files
+build/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sdf
+*.opensdf
+*.opendb
+*.db
+*.ide
+*.log
+
+CMakeCache.txt
+
+CMakeFiles/
+
+cmake_install.cmake
+
+install_manifest.txt
