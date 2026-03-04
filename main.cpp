@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <fstream>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -76,6 +77,8 @@ private:
     std::vector<VkSemaphore> imageAvailableSemaphores;
     std::vector<VkSemaphore> renderFinishedSemaphores;
     std::vector<VkFence> inFlightFences;
+    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+    VkPipeline graphicsPipeline    = VK_NULL_HANDLE;
     // Stores the currentFrame index (0..MAX_FRAMES_IN_FLIGHT-1)
     // that last submitted to this swapchain image, or kNoFrame.
     static constexpr uint32_t kNoFrame = UINT32_MAX;
@@ -102,7 +105,10 @@ private:
     void createCommandPool();
     void createCommandBuffer();
     void createSyncObjects();
+    void createGraphicsPipeline();
     void recordCommandBuffer(VkCommandBuffer cmdBuffer, uint32_t imageIndex);
+    static std::vector<char> readSpvFile(const std::string &filename);
+    VkShaderModule createShaderModule(const std::vector<char> &code);
     bool checkValidationLayerSupport() const;
     std::vector<const char *> getRequiredExtensions() const;
     bool isDeviceSuitable(VkPhysicalDevice candidateDevice) const;
@@ -174,6 +180,7 @@ void SplatCoreApp::initVulkan()
     createSwapChain();
     createImageViews();
     createRenderPass();
+    createGraphicsPipeline();
     createFramebuffers();
     createCommandPool();
     createCommandBuffer();
@@ -235,6 +242,18 @@ void SplatCoreApp::cleanup()
     {
         vkDestroyCommandPool(device, commandPool, nullptr);
         commandPool = VK_NULL_HANDLE;
+    }
+
+    if (graphicsPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(device, graphicsPipeline, nullptr);
+        graphicsPipeline = VK_NULL_HANDLE;
+    }
+
+    if (pipelineLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+        pipelineLayout = VK_NULL_HANDLE;
     }
 
     for (VkFramebuffer framebuffer : swapChainFramebuffers)
@@ -813,11 +832,175 @@ void SplatCoreApp::recordCommandBuffer(VkCommandBuffer cmdBuffer, uint32_t image
     renderPassInfo.pClearValues = &clearColor;
 
     vkCmdBeginRenderPass(cmdBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+    vkCmdBindPipeline(cmdBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
+    vkCmdDraw(cmdBuffer, 3, 1, 0, 0);   // 3 hardcoded vertices, 1 instance
+
     vkCmdEndRenderPass(cmdBuffer);
 
     if (vkEndCommandBuffer(cmdBuffer) != VK_SUCCESS)
     {
         throw std::runtime_error("Failed to record command buffer.");
+    }
+}
+
+std::vector<char> SplatCoreApp::readSpvFile(const std::string &filename)
+{
+    std::ifstream file(filename, std::ios::ate | std::ios::binary);
+    if (!file.is_open())
+    {
+        throw std::runtime_error("Failed to open shader file: " + filename);
+    }
+    const size_t fileSize = static_cast<size_t>(file.tellg());
+    std::vector<char> buffer(fileSize);
+    file.seekg(0);
+    file.read(buffer.data(), static_cast<std::streamsize>(fileSize));
+    return buffer;
+}
+
+VkShaderModule SplatCoreApp::createShaderModule(const std::vector<char> &code)
+{
+    VkShaderModuleCreateInfo createInfo{};
+    createInfo.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    createInfo.codeSize = code.size();
+    createInfo.pCode    = reinterpret_cast<const uint32_t *>(code.data());
+
+    VkShaderModule shaderModule = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(device, &createInfo, nullptr, &shaderModule) != VK_SUCCESS)
+    {
+        throw std::runtime_error("Failed to create shader module.");
+    }
+    return shaderModule;
+}
+
+void SplatCoreApp::createGraphicsPipeline()
+{
+    // SHADER_DIR is injected by CMake as an absolute path string.
+    const std::string shaderDir = SHADER_DIR;
+    const std::vector<char> vertCode = readSpvFile(shaderDir + "triangle.vert.spv");
+    const std::vector<char> fragCode = readSpvFile(shaderDir + "triangle.frag.spv");
+
+    VkShaderModule vertShaderModule = createShaderModule(vertCode);
+    VkShaderModule fragShaderModule = createShaderModule(fragCode);
+
+    VkPipelineShaderStageCreateInfo vertStageInfo{};
+    vertStageInfo.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    vertStageInfo.stage  = VK_SHADER_STAGE_VERTEX_BIT;
+    vertStageInfo.module = vertShaderModule;
+    vertStageInfo.pName  = "main";
+
+    VkPipelineShaderStageCreateInfo fragStageInfo{};
+    fragStageInfo.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    fragStageInfo.stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
+    fragStageInfo.module = fragShaderModule;
+    fragStageInfo.pName  = "main";
+
+    const VkPipelineShaderStageCreateInfo shaderStages[] = {
+        vertStageInfo, fragStageInfo};
+
+    // No vertex buffers — positions and colors are hardcoded in the vertex shader.
+    VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
+    vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vertexInputInfo.vertexBindingDescriptionCount   = 0;
+    vertexInputInfo.pVertexBindingDescriptions      = nullptr;
+    vertexInputInfo.vertexAttributeDescriptionCount = 0;
+    vertexInputInfo.pVertexAttributeDescriptions    = nullptr;
+
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
+    inputAssembly.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    inputAssembly.primitiveRestartEnable = VK_FALSE;
+
+    // Fixed viewport and scissor — window is non-resizable (GLFW_RESIZABLE=FALSE).
+    VkViewport viewport{};
+    viewport.x        = 0.0f;
+    viewport.y        = 0.0f;
+    viewport.width    = static_cast<float>(swapChainExtent.width);
+    viewport.height   = static_cast<float>(swapChainExtent.height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+
+    VkRect2D scissor{};
+    scissor.offset = {0, 0};
+    scissor.extent = swapChainExtent;
+
+    VkPipelineViewportStateCreateInfo viewportState{};
+    viewportState.sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1;
+    viewportState.pViewports    = &viewport;
+    viewportState.scissorCount  = 1;
+    viewportState.pScissors     = &scissor;
+
+    VkPipelineRasterizationStateCreateInfo rasterizer{};
+    rasterizer.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterizer.depthClampEnable        = VK_FALSE;
+    rasterizer.rasterizerDiscardEnable = VK_FALSE;
+    rasterizer.polygonMode             = VK_POLYGON_MODE_FILL;
+    rasterizer.lineWidth               = 1.0f;
+    rasterizer.cullMode                = VK_CULL_MODE_BACK_BIT;
+    rasterizer.frontFace               = VK_FRONT_FACE_CLOCKWISE;
+    rasterizer.depthBiasEnable         = VK_FALSE;
+
+    VkPipelineMultisampleStateCreateInfo multisampling{};
+    multisampling.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisampling.sampleShadingEnable  = VK_FALSE;
+    multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineColorBlendAttachmentState colorBlendAttachment{};
+    colorBlendAttachment.colorWriteMask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    colorBlendAttachment.blendEnable = VK_FALSE;
+
+    VkPipelineColorBlendStateCreateInfo colorBlending{};
+    colorBlending.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlending.logicOpEnable   = VK_FALSE;
+    colorBlending.attachmentCount = 1;
+    colorBlending.pAttachments    = &colorBlendAttachment;
+
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
+    pipelineLayoutInfo.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pipelineLayoutInfo.setLayoutCount          = 0;
+    pipelineLayoutInfo.pushConstantRangeCount  = 0;
+
+    if (vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr,
+                               &pipelineLayout) != VK_SUCCESS)
+    {
+        // Clean up shader modules before propagating the error.
+        vkDestroyShaderModule(device, fragShaderModule, nullptr);
+        vkDestroyShaderModule(device, vertShaderModule, nullptr);
+        throw std::runtime_error("Failed to create pipeline layout.");
+    }
+
+    VkGraphicsPipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineInfo.stageCount          = 2;
+    pipelineInfo.pStages             = shaderStages;
+    pipelineInfo.pVertexInputState   = &vertexInputInfo;
+    pipelineInfo.pInputAssemblyState = &inputAssembly;
+    pipelineInfo.pViewportState      = &viewportState;
+    pipelineInfo.pRasterizationState = &rasterizer;
+    pipelineInfo.pMultisampleState   = &multisampling;
+    pipelineInfo.pDepthStencilState  = nullptr;
+    pipelineInfo.pColorBlendState    = &colorBlending;
+    pipelineInfo.pDynamicState       = nullptr;
+    pipelineInfo.layout              = pipelineLayout;
+    pipelineInfo.renderPass          = renderPass;
+    pipelineInfo.subpass             = 0;
+    pipelineInfo.basePipelineHandle  = VK_NULL_HANDLE;
+    pipelineInfo.basePipelineIndex   = -1;
+
+    const VkResult result = vkCreateGraphicsPipelines(
+        device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &graphicsPipeline);
+
+    // Shader modules are never needed after pipeline creation — destroy immediately.
+    // This satisfies the Validation Layer requirement.
+    vkDestroyShaderModule(device, fragShaderModule, nullptr);
+    vkDestroyShaderModule(device, vertShaderModule, nullptr);
+
+    if (result != VK_SUCCESS)
+    {
+        throw std::runtime_error("Failed to create graphics pipeline.");
     }
 }
 

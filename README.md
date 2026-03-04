@@ -3,6 +3,8 @@ A high-performance, hardware-accelerated 3D Gaussian Splatting engine engineered
 
 ## Changelog
 
+## v0.2 - RGB gradient triangle, graphics pipeline
+
 ### v0.1 - Hello Vulkan
 - Implemented object-oriented Vulkan bootstrap (`SplatCoreApp`) with GLFW window creation.
 - Added Vulkan initialization chain: Instance, Validation Layer (`VK_LAYER_KHRONOS_validation`), Debug Utils Messenger, Surface, Physical/Logical Device, Swapchain, Image Views, Render Pass, Framebuffers, Command Pool/Buffer, and sync primitives.
