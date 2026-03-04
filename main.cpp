@@ -2,6 +2,7 @@
 #include <GLFW/glfw3.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -24,8 +25,12 @@ private:
     static constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
     static constexpr const char *kWindowTitle = "SplatCore v0.1";
 
+#ifdef VK_ENABLE_VALIDATION_LAYERS
     const std::vector<const char *> validationLayers = {
         "VK_LAYER_KHRONOS_validation"};
+#else
+    const std::vector<const char *> validationLayers;   // empty in Release
+#endif
 
     const std::vector<const char *> deviceExtensions = {
         VK_KHR_SWAPCHAIN_EXTENSION_NAME};
@@ -71,11 +76,13 @@ private:
     std::vector<VkSemaphore> imageAvailableSemaphores;
     std::vector<VkSemaphore> renderFinishedSemaphores;
     std::vector<VkFence> inFlightFences;
-    std::vector<VkFence> imagesInFlight;
+    // Stores the currentFrame index (0..MAX_FRAMES_IN_FLIGHT-1)
+    // that last submitted to this swapchain image, or kNoFrame.
+    static constexpr uint32_t kNoFrame = UINT32_MAX;
+    std::vector<uint32_t> imagesInFlight;
     uint32_t currentFrame = 0;
-    uint32_t acquireSemaphoreCursor = 0;
 
-    bool validationErrorDetected = false;
+    std::atomic<bool> validationErrorDetected{false};
     std::string validationErrorMessage;
 
     void initWindow();
@@ -158,7 +165,9 @@ void SplatCoreApp::initWindow()
 void SplatCoreApp::initVulkan()
 {
     createInstance();
+#ifdef VK_ENABLE_VALIDATION_LAYERS
     setupDebugMessenger();
+#endif
     createSurface();
     pickPhysicalDevice();
     createLogicalDevice();
@@ -303,14 +312,13 @@ void SplatCoreApp::drawFrame()
         throw std::runtime_error("vkResetFences failed.");
     }
 
-    // 2) Acquire with a rotating semaphore slot, then bind semaphore to imageIndex.
-    const uint32_t acquireSlot = acquireSemaphoreCursor % static_cast<uint32_t>(imageAvailableSemaphores.size());
+    // 2) Acquire with per-frame semaphore slot.
     uint32_t imageIndex = 0;
     const VkResult acquireResult = vkAcquireNextImageKHR(
         device,
         swapChain,
         UINT64_MAX,
-        imageAvailableSemaphores[acquireSlot],
+        imageAvailableSemaphores[currentFrame],
         VK_NULL_HANDLE,
         &imageIndex);
 
@@ -329,21 +337,20 @@ void SplatCoreApp::drawFrame()
         throw std::runtime_error("vkAcquireNextImageKHR failed.");
     }
 
-    if (acquireSlot != imageIndex)
-    {
-        std::swap(imageAvailableSemaphores[acquireSlot], imageAvailableSemaphores[imageIndex]);
-    }
-    acquireSemaphoreCursor = (acquireSemaphoreCursor + 1) % static_cast<uint32_t>(imageAvailableSemaphores.size());
-
     // 3) Per-image fence tracking: ensure this image is physically free.
-    if (imagesInFlight[imageIndex] != VK_NULL_HANDLE)
     {
-        if (vkWaitForFences(device, 1, &imagesInFlight[imageIndex], VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+        const uint32_t prevFrame = imagesInFlight[imageIndex];
+        // Guard: skip if this image was last used by the SAME frame slot
+        // (fence was already reset above) or if it was never used.
+        if (prevFrame != kNoFrame && prevFrame != currentFrame)
         {
-            throw std::runtime_error("vkWaitForFences failed for imagesInFlight[imageIndex].");
+            if (vkWaitForFences(device, 1, &inFlightFences[prevFrame], VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+            {
+                throw std::runtime_error("vkWaitForFences failed for imagesInFlight[imageIndex].");
+            }
         }
+        imagesInFlight[imageIndex] = currentFrame;
     }
-    imagesInFlight[imageIndex] = inFlightFences[currentFrame];
 
     VkCommandBuffer currentCommandBuffer = commandBuffers[currentFrame];
     if (vkResetCommandBuffer(currentCommandBuffer, 0) != VK_SUCCESS)
@@ -352,8 +359,8 @@ void SplatCoreApp::drawFrame()
     }
     recordCommandBuffer(currentCommandBuffer, imageIndex);
 
-    // 4) GPU sync by imageIndex.
-    const VkSemaphore waitSemaphores[] = {imageAvailableSemaphores[imageIndex]};
+    // imageAvailable is indexed by currentFrame
+    const VkSemaphore waitSemaphores[] = {imageAvailableSemaphores[currentFrame]};
     const VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
     const VkSemaphore signalSemaphores[] = {renderFinishedSemaphores[imageIndex]};
 
@@ -399,10 +406,13 @@ void SplatCoreApp::drawFrame()
 
 void SplatCoreApp::createInstance()
 {
+#ifdef VK_ENABLE_VALIDATION_LAYERS
     if (!checkValidationLayerSupport())
     {
-        throw std::runtime_error("Validation layer VK_LAYER_KHRONOS_validation is not available.");
+        throw std::runtime_error(
+            "Validation layer VK_LAYER_KHRONOS_validation is not available.");
     }
+#endif
 
     VkApplicationInfo appInfo{};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -414,18 +424,23 @@ void SplatCoreApp::createInstance()
 
     const std::vector<const char *> extensions = getRequiredExtensions();
 
-    VkDebugUtilsMessengerCreateInfoEXT debugCreateInfo{};
-    populateDebugMessengerCreateInfo(debugCreateInfo);
-    debugCreateInfo.pUserData = this;
-
     VkInstanceCreateInfo createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     createInfo.pApplicationInfo = &appInfo;
-    createInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
+    createInfo.enabledExtensionCount =
+        static_cast<uint32_t>(extensions.size());
     createInfo.ppEnabledExtensionNames = extensions.data();
-    createInfo.enabledLayerCount = static_cast<uint32_t>(validationLayers.size());
-    createInfo.ppEnabledLayerNames = validationLayers.data();
+    createInfo.enabledLayerCount =
+        static_cast<uint32_t>(validationLayers.size());
+    createInfo.ppEnabledLayerNames =
+        validationLayers.empty() ? nullptr : validationLayers.data();
+
+#ifdef VK_ENABLE_VALIDATION_LAYERS
+    VkDebugUtilsMessengerCreateInfoEXT debugCreateInfo{};
+    populateDebugMessengerCreateInfo(debugCreateInfo);
+    debugCreateInfo.pUserData = this;
     createInfo.pNext = &debugCreateInfo;
+#endif
 
     if (vkCreateInstance(&createInfo, nullptr, &instance) != VK_SUCCESS)
     {
@@ -531,7 +546,8 @@ void SplatCoreApp::createLogicalDevice()
     createInfo.enabledExtensionCount = static_cast<uint32_t>(deviceExtensions.size());
     createInfo.ppEnabledExtensionNames = deviceExtensions.data();
     createInfo.enabledLayerCount = static_cast<uint32_t>(validationLayers.size());
-    createInfo.ppEnabledLayerNames = validationLayers.data();
+    createInfo.ppEnabledLayerNames =
+        validationLayers.empty() ? nullptr : validationLayers.data();
 
     if (vkCreateDevice(physicalDevice, &createInfo, nullptr, &device) != VK_SUCCESS)
     {
@@ -732,10 +748,13 @@ void SplatCoreApp::createCommandBuffer()
 
 void SplatCoreApp::createSyncObjects()
 {
-    imageAvailableSemaphores.resize(swapChainImages.size());
+    // imageAvailable: one per frame-in-flight slot (indexed by currentFrame)
+    imageAvailableSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
+    // renderFinished: one per swapchain image (indexed by imageIndex)
+    // because the presentation engine holds this semaphore until display is done
     renderFinishedSemaphores.resize(swapChainImages.size());
     inFlightFences.resize(MAX_FRAMES_IN_FLIGHT);
-    imagesInFlight.resize(swapChainImages.size(), VK_NULL_HANDLE);
+    imagesInFlight.resize(swapChainImages.size(), kNoFrame);
 
     VkSemaphoreCreateInfo semaphoreInfo{};
     semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
@@ -744,12 +763,21 @@ void SplatCoreApp::createSyncObjects()
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
+    // Loop A: imageAvailable semaphores — MAX_FRAMES_IN_FLIGHT count
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
+    {
+        if (vkCreateSemaphore(device, &semaphoreInfo, nullptr, &imageAvailableSemaphores[i]) != VK_SUCCESS)
+        {
+            throw std::runtime_error("Failed to create imageAvailable semaphore.");
+        }
+    }
+
+    // Loop B: renderFinished semaphores — one per swapchain image
     for (size_t i = 0; i < swapChainImages.size(); ++i)
     {
-        if (vkCreateSemaphore(device, &semaphoreInfo, nullptr, &imageAvailableSemaphores[i]) != VK_SUCCESS ||
-            vkCreateSemaphore(device, &semaphoreInfo, nullptr, &renderFinishedSemaphores[i]) != VK_SUCCESS)
+        if (vkCreateSemaphore(device, &semaphoreInfo, nullptr, &renderFinishedSemaphores[i]) != VK_SUCCESS)
         {
-            throw std::runtime_error("Failed to create image-indexed semaphores.");
+            throw std::runtime_error("Failed to create renderFinished semaphore.");
         }
     }
 
@@ -831,7 +859,9 @@ std::vector<const char *> SplatCoreApp::getRequiredExtensions() const
     }
 
     std::vector<const char *> extensions(glfwExtensions, glfwExtensions + glfwExtensionCount);
+#ifdef VK_ENABLE_VALIDATION_LAYERS
     extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+#endif
     return extensions;
 }
 
@@ -940,15 +970,15 @@ VkSurfaceFormatKHR SplatCoreApp::chooseSwapSurfaceFormat(const std::vector<VkSur
 
 VkPresentModeKHR SplatCoreApp::chooseSwapPresentMode(const std::vector<VkPresentModeKHR> &availablePresentModes)
 {
-    for (const VkPresentModeKHR presentMode : availablePresentModes)
+    for (const VkPresentModeKHR mode : availablePresentModes)
     {
-        if (presentMode == VK_PRESENT_MODE_FIFO_KHR)
+        if (mode == VK_PRESENT_MODE_MAILBOX_KHR)
         {
-            return presentMode;
+            return mode; // low-latency triple-buffer if available
         }
     }
-
-    throw std::runtime_error("VK_PRESENT_MODE_FIFO_KHR is not available.");
+    // VK_PRESENT_MODE_FIFO_KHR is guaranteed by the Vulkan spec.
+    return VK_PRESENT_MODE_FIFO_KHR;
 }
 
 VkExtent2D SplatCoreApp::chooseSwapExtent(const VkSurfaceCapabilitiesKHR &capabilities) const
