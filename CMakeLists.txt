@@ -28,6 +28,8 @@ set(SHADER_SOURCES
     "${SHADER_SRC_DIR}/triangle.frag"
     "${SHADER_SRC_DIR}/cube.vert"
     "${SHADER_SRC_DIR}/cube.frag"
+    "${SHADER_SRC_DIR}/point.vert"
+    "${SHADER_SRC_DIR}/point.frag"
 )
 
 set(SPV_OUTPUTS "")

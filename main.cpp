@@ -9,14 +9,15 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <chrono>
 #include <fstream>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -30,8 +31,8 @@ struct Vertex
     static VkVertexInputBindingDescription getBindingDescription()
     {
         VkVertexInputBindingDescription binding{};
-        binding.binding   = 0;
-        binding.stride    = sizeof(Vertex);
+        binding.binding = 0;
+        binding.stride = sizeof(Vertex);
         binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
         return binding;
     }
@@ -40,14 +41,14 @@ struct Vertex
     getAttributeDescriptions()
     {
         std::array<VkVertexInputAttributeDescription, 2> attrs{};
-        attrs[0].binding  = 0;
+        attrs[0].binding = 0;
         attrs[0].location = 0;
-        attrs[0].format   = VK_FORMAT_R32G32B32_SFLOAT;
-        attrs[0].offset   = offsetof(Vertex, pos);
-        attrs[1].binding  = 0;
+        attrs[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+        attrs[0].offset = offsetof(Vertex, pos);
+        attrs[1].binding = 0;
         attrs[1].location = 1;
-        attrs[1].format   = VK_FORMAT_R32G32B32_SFLOAT;
-        attrs[1].offset   = offsetof(Vertex, color);
+        attrs[1].format = VK_FORMAT_R32G32B32_SFLOAT;
+        attrs[1].offset = offsetof(Vertex, color);
         return attrs;
     }
 };
@@ -60,27 +61,59 @@ struct UniformBufferObject
     alignas(16) glm::mat4 proj;
 };
 
-// ── Cube geometry ─────────────────────────────────────────────────────────
-static const std::vector<Vertex> kCubeVertices = {
-    // front   (red tones)
-    {{-0.5f, -0.5f,  0.5f}, {1.0f, 0.0f, 0.0f}},
-    {{ 0.5f, -0.5f,  0.5f}, {0.8f, 0.2f, 0.0f}},
-    {{ 0.5f,  0.5f,  0.5f}, {1.0f, 0.4f, 0.0f}},
-    {{-0.5f,  0.5f,  0.5f}, {0.9f, 0.1f, 0.1f}},
-    // back    (blue/cyan tones)
-    {{-0.5f, -0.5f, -0.5f}, {0.0f, 0.4f, 1.0f}},
-    {{ 0.5f, -0.5f, -0.5f}, {0.0f, 1.0f, 0.8f}},
-    {{ 0.5f,  0.5f, -0.5f}, {0.2f, 0.6f, 1.0f}},
-    {{-0.5f,  0.5f, -0.5f}, {0.0f, 0.8f, 1.0f}},
-};
+// ─────────────────────────────────────────────────────────────────────────
 
-static const std::vector<uint32_t> kCubeIndices = {
-    0, 1, 2,  2, 3, 0,   // front
-    1, 5, 6,  6, 2, 1,   // right
-    5, 4, 7,  7, 6, 5,   // back
-    4, 0, 3,  3, 7, 4,   // left
-    3, 2, 6,  6, 7, 3,   // top
-    4, 5, 1,  1, 0, 4,   // bottom
+// ── FPS Camera ───────────────────────────────────────────────────────────
+struct Camera
+{
+    glm::vec3 position = {0.0f, 0.0f, 3.0f};
+    float yaw = -90.0f;        // degrees, -90 = facing -Z
+    float pitch = 0.0f;        // degrees
+    float speed = 5.0f;        // world units / second
+    float sensitivity = 0.1f;  // degrees / pixel
+    glm::vec3 worldUp = {0.0f, 1.0f, 0.0f};
+
+    glm::vec3 getFront() const
+    {
+        glm::vec3 f;
+        f.x = std::cos(glm::radians(yaw)) * std::cos(glm::radians(pitch));
+        f.y = std::sin(glm::radians(pitch));
+        f.z = std::sin(glm::radians(yaw)) * std::cos(glm::radians(pitch));
+        return glm::normalize(f);
+    }
+
+    glm::mat4 getView() const
+    {
+        const glm::vec3 front = getFront();
+        return glm::lookAt(position, position + front, worldUp);
+    }
+
+    void processKeyboard(GLFWwindow *window, float deltaTime)
+    {
+        const glm::vec3 front = getFront();
+        const glm::vec3 right = glm::normalize(glm::cross(front, worldUp));
+        const float v = speed * deltaTime;
+
+        if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS)
+            position += front * v;
+        if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS)
+            position -= front * v;
+        if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS)
+            position -= right * v;
+        if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS)
+            position += right * v;
+        if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS)
+            position -= worldUp * v;
+        if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS)
+            position += worldUp * v;
+    }
+
+    // Apply mouse delta (pixels). Y is pre-inverted by caller.
+    void processMouse(float dx, float dy)
+    {
+        yaw += dx * sensitivity;
+        pitch = glm::clamp(pitch + dy * sensitivity, -89.0f, 89.0f);
+    }
 };
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -89,18 +122,19 @@ class SplatCoreApp
 public:
     ~SplatCoreApp();
     void run();
+    void setPlyPath(const std::string &path) { plyFilePath = path; }
 
 private:
     static constexpr uint32_t kWidth = 800;
     static constexpr uint32_t kHeight = 600;
     static constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
-    static constexpr const char *kWindowTitle = "SplatCore v0.4";
+    static constexpr const char *kWindowTitle = "SplatCore v0.5";
 
 #ifdef VK_ENABLE_VALIDATION_LAYERS
     const std::vector<const char *> validationLayers = {
         "VK_LAYER_KHRONOS_validation"};
 #else
-    const std::vector<const char *> validationLayers;   // empty in Release
+    const std::vector<const char *> validationLayers; // empty in Release
 #endif
 
     const std::vector<const char *> deviceExtensions = {
@@ -147,20 +181,25 @@ private:
     std::vector<VkSemaphore> imageAvailableSemaphores;
     std::vector<VkSemaphore> renderFinishedSemaphores;
     std::vector<VkFence> inFlightFences;
+    // Depth buffer (tied to swapchain extent)
+    VkImage depthImage = VK_NULL_HANDLE;
+    VkDeviceMemory depthImageMemory = VK_NULL_HANDLE;
+    VkImageView depthImageView = VK_NULL_HANDLE;
+
     VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
-    VkPipelineLayout pipelineLayout           = VK_NULL_HANDLE;
-    VkPipeline graphicsPipeline               = VK_NULL_HANDLE;
+    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+    VkPipeline graphicsPipeline = VK_NULL_HANDLE;
 
-    VkBuffer       vertexBuffer       = VK_NULL_HANDLE;
-    VkDeviceMemory vertexBufferMemory = VK_NULL_HANDLE;
-    VkBuffer       indexBuffer        = VK_NULL_HANDLE;
-    VkDeviceMemory indexBufferMemory  = VK_NULL_HANDLE;
+    // Point cloud geometry buffer
+    VkBuffer pointVertexBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory pointVertexBufferMemory = VK_NULL_HANDLE;
+    uint32_t pointCount = 0;
 
-    std::vector<VkBuffer>       uniformBuffers;
+    std::vector<VkBuffer> uniformBuffers;
     std::vector<VkDeviceMemory> uniformBuffersMemory;
-    std::vector<void *>         uniformBuffersMapped;
+    std::vector<void *> uniformBuffersMapped;
 
-    VkDescriptorPool             descriptorPool = VK_NULL_HANDLE;
+    VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
     std::vector<VkDescriptorSet> descriptorSets;
     // Stores the currentFrame index (0..MAX_FRAMES_IN_FLIGHT-1)
     // that last submitted to this swapchain image, or kNoFrame.
@@ -168,8 +207,19 @@ private:
     std::vector<uint32_t> imagesInFlight;
     uint32_t currentFrame = 0;
     bool framebufferResized = false;
-    double lastFpsTime     = 0.0;
-    uint32_t frameCount    = 0;
+    double lastFpsTime = 0.0;
+    uint32_t frameCount = 0;
+    double lastFrameTime = 0.0;
+
+    // FPS camera and mouse state
+    Camera camera{};
+    bool mouseCaptured = false;
+    bool firstMouse = true;
+    double lastMouseX = 0.0;
+    double lastMouseY = 0.0;
+
+    // PLY file path — set from argv before run()
+    std::string plyFilePath;
 
     std::atomic<bool> validationErrorDetected{false};
     std::string validationErrorMessage;
@@ -193,10 +243,10 @@ private:
     void createSyncObjects();
     void cleanupSwapChain();
     void recreateSwapChain();
+    void createDepthResources();
     void createDescriptorSetLayout();
     void createGraphicsPipeline();
-    void createVertexBuffer();
-    void createIndexBuffer();
+    void loadPointCloud();
     void createUniformBuffers();
     void createDescriptorPool();
     void createDescriptorSets();
@@ -213,8 +263,25 @@ private:
                     VkDeviceSize size);
     VkCommandBuffer beginSingleTimeCommands();
     void endSingleTimeCommands(VkCommandBuffer commandBuffer);
+    void createImage(uint32_t width, uint32_t height,
+                     VkFormat format, VkImageTiling tiling,
+                     VkImageUsageFlags usage,
+                     VkMemoryPropertyFlags properties,
+                     VkImage &image, VkDeviceMemory &imageMemory);
+    VkImageView createImageView(VkImage image, VkFormat format,
+                                VkImageAspectFlags aspectFlags);
+    VkFormat findSupportedFormat(const std::vector<VkFormat> &candidates,
+                                 VkImageTiling tiling,
+                                 VkFormatFeatureFlags features) const;
+    VkFormat findDepthFormat() const;
     static void framebufferResizeCallback(GLFWwindow *window,
                                           int width, int height);
+    static void cursorPosCallback(GLFWwindow *window,
+                                  double xpos, double ypos);
+    static void mouseButtonCallback(GLFWwindow *window,
+                                    int button, int action, int mods);
+    static void scrollCallback(GLFWwindow *window,
+                               double xoffset, double yoffset);
     void recordCommandBuffer(VkCommandBuffer cmdBuffer, uint32_t imageIndex);
     static std::vector<char> readSpvFile(const std::string &filename);
     VkShaderModule createShaderModule(const std::vector<char> &code);
@@ -277,7 +344,11 @@ void SplatCoreApp::initWindow()
     }
     glfwSetWindowUserPointer(window, this);
     glfwSetFramebufferSizeCallback(window, framebufferResizeCallback);
+    glfwSetCursorPosCallback(window, cursorPosCallback);
+    glfwSetMouseButtonCallback(window, mouseButtonCallback);
+    glfwSetScrollCallback(window, scrollCallback);
     lastFpsTime = glfwGetTime();
+    lastFrameTime = glfwGetTime();
 }
 
 void SplatCoreApp::initVulkan()
@@ -291,13 +362,13 @@ void SplatCoreApp::initVulkan()
     createLogicalDevice();
     createSwapChain();
     createImageViews();
-    createRenderPass();
-    createDescriptorSetLayout();   // must exist before pipeline
+    createDepthResources(); // depth image sized to swapchain extent
+    createRenderPass();     // renderPass references depth format
+    createDescriptorSetLayout(); // must exist before pipeline
     createGraphicsPipeline();
     createFramebuffers();
     createCommandPool();
-    createVertexBuffer();          // needs commandPool for staging copy
-    createIndexBuffer();
+    loadPointCloud(); // parse PLY + staging upload to GPU
     createUniformBuffers();
     createDescriptorPool();
     createDescriptorSets();
@@ -321,6 +392,23 @@ void SplatCoreApp::mainLoop()
 
 void SplatCoreApp::cleanupSwapChain()
 {
+    // Depth buffer is tied to swapchain extent — destroy before framebuffers.
+    if (depthImageView != VK_NULL_HANDLE)
+    {
+        vkDestroyImageView(device, depthImageView, nullptr);
+        depthImageView = VK_NULL_HANDLE;
+    }
+    if (depthImage != VK_NULL_HANDLE)
+    {
+        vkDestroyImage(device, depthImage, nullptr);
+        depthImage = VK_NULL_HANDLE;
+    }
+    if (depthImageMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(device, depthImageMemory, nullptr);
+        depthImageMemory = VK_NULL_HANDLE;
+    }
+
     for (VkFramebuffer framebuffer : swapChainFramebuffers)
     {
         vkDestroyFramebuffer(device, framebuffer, nullptr);
@@ -356,9 +444,9 @@ void SplatCoreApp::recreateSwapChain()
 
     cleanupSwapChain();
 
-    // Rebuild swapchain-dependent resources.
     createSwapChain();
     createImageViews();
+    createDepthResources(); // must come before createFramebuffers
     createFramebuffers();
 
     // renderFinishedSemaphores are sized by swapchain image count,
@@ -468,26 +556,16 @@ void SplatCoreApp::cleanup()
     uniformBuffersMemory.clear();
     uniformBuffersMapped.clear();
 
-    // Geometry buffers
-    if (indexBuffer != VK_NULL_HANDLE)
+    // Point cloud geometry buffer
+    if (pointVertexBuffer != VK_NULL_HANDLE)
     {
-        vkDestroyBuffer(device, indexBuffer, nullptr);
-        indexBuffer = VK_NULL_HANDLE;
+        vkDestroyBuffer(device, pointVertexBuffer, nullptr);
+        pointVertexBuffer = VK_NULL_HANDLE;
     }
-    if (indexBufferMemory != VK_NULL_HANDLE)
+    if (pointVertexBufferMemory != VK_NULL_HANDLE)
     {
-        vkFreeMemory(device, indexBufferMemory, nullptr);
-        indexBufferMemory = VK_NULL_HANDLE;
-    }
-    if (vertexBuffer != VK_NULL_HANDLE)
-    {
-        vkDestroyBuffer(device, vertexBuffer, nullptr);
-        vertexBuffer = VK_NULL_HANDLE;
-    }
-    if (vertexBufferMemory != VK_NULL_HANDLE)
-    {
-        vkFreeMemory(device, vertexBufferMemory, nullptr);
-        vertexBufferMemory = VK_NULL_HANDLE;
+        vkFreeMemory(device, pointVertexBufferMemory, nullptr);
+        pointVertexBufferMemory = VK_NULL_HANDLE;
     }
 
     if (graphicsPipeline != VK_NULL_HANDLE)
@@ -506,7 +584,7 @@ void SplatCoreApp::cleanup()
         renderPass = VK_NULL_HANDLE;
     }
 
-    cleanupSwapChain();   // destroys framebuffers, imageViews, swapchain
+    cleanupSwapChain(); // destroys framebuffers, imageViews, swapchain
 
     if (device != VK_NULL_HANDLE)
     {
@@ -548,6 +626,33 @@ void SplatCoreApp::cleanup()
 void SplatCoreApp::drawFrame()
 {
     failIfValidationIssueDetected();
+
+    // 0) Delta time — camera movement is frame-rate independent.
+    const double now = glfwGetTime();
+    const float deltaTime = static_cast<float>(now - lastFrameTime);
+    lastFrameTime = now;
+
+    // Keyboard: WASD movement
+    camera.processKeyboard(window, deltaTime);
+
+    // ESC: first press releases mouse, second press closes window
+    static bool escWasPressed = false;
+    static bool escCloseArmed = false;
+    const bool escNow = (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS);
+    if (escNow && !escWasPressed)
+    {
+        if (!escCloseArmed)
+        {
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+            mouseCaptured = false;
+            escCloseArmed = true;
+        }
+        else
+        {
+            glfwSetWindowShouldClose(window, GLFW_TRUE);
+        }
+    }
+    escWasPressed = escNow;
 
     // 1) CPU throttle: wait for this frame slot to be free.
     //    Do NOT reset the fence yet — acquire might fail.
@@ -612,19 +717,19 @@ void SplatCoreApp::drawFrame()
     recordCommandBuffer(currentCommandBuffer, imageIndex);
 
     // 6) Submit.
-    const VkSemaphore waitSemaphores[]   = {imageAvailableSemaphores[currentFrame]};
+    const VkSemaphore waitSemaphores[] = {imageAvailableSemaphores[currentFrame]};
     const VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
     const VkSemaphore signalSemaphores[] = {renderFinishedSemaphores[imageIndex]};
 
     VkSubmitInfo submitInfo{};
-    submitInfo.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.waitSemaphoreCount   = 1;
-    submitInfo.pWaitSemaphores      = waitSemaphores;
-    submitInfo.pWaitDstStageMask    = waitStages;
-    submitInfo.commandBufferCount   = 1;
-    submitInfo.pCommandBuffers      = &currentCommandBuffer;
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.waitSemaphoreCount = 1;
+    submitInfo.pWaitSemaphores = waitSemaphores;
+    submitInfo.pWaitDstStageMask = waitStages;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &currentCommandBuffer;
     submitInfo.signalSemaphoreCount = 1;
-    submitInfo.pSignalSemaphores    = signalSemaphores;
+    submitInfo.pSignalSemaphores = signalSemaphores;
 
     if (vkQueueSubmit(graphicsQueue, 1, &submitInfo,
                       inFlightFences[currentFrame]) != VK_SUCCESS)
@@ -635,16 +740,16 @@ void SplatCoreApp::drawFrame()
     // 7) Present.
     const VkSwapchainKHR swapChains[] = {swapChain};
     VkPresentInfoKHR presentInfo{};
-    presentInfo.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     presentInfo.waitSemaphoreCount = 1;
-    presentInfo.pWaitSemaphores    = signalSemaphores;
-    presentInfo.swapchainCount     = 1;
-    presentInfo.pSwapchains        = swapChains;
-    presentInfo.pImageIndices      = &imageIndex;
+    presentInfo.pWaitSemaphores = signalSemaphores;
+    presentInfo.swapchainCount = 1;
+    presentInfo.pSwapchains = swapChains;
+    presentInfo.pImageIndices = &imageIndex;
 
     const VkResult presentResult = vkQueuePresentKHR(presentQueue, &presentInfo);
     if (presentResult == VK_ERROR_OUT_OF_DATE_KHR ||
-        presentResult == VK_SUBOPTIMAL_KHR         ||
+        presentResult == VK_SUBOPTIMAL_KHR ||
         framebufferResized)
     {
         framebufferResized = false;
@@ -659,7 +764,6 @@ void SplatCoreApp::drawFrame()
 
     // 8) FPS counter — update title every second.
     frameCount++;
-    const double now = glfwGetTime();
     if (now - lastFpsTime >= 1.0)
     {
         const double fps = static_cast<double>(frameCount) / (now - lastFpsTime);
@@ -667,7 +771,7 @@ void SplatCoreApp::drawFrame()
             std::string(kWindowTitle) +
             "  |  FPS: " + std::to_string(static_cast<int>(fps));
         glfwSetWindowTitle(window, title.c_str());
-        frameCount  = 0;
+        frameCount = 0;
         lastFpsTime = now;
     }
 
@@ -719,8 +823,8 @@ void SplatCoreApp::createInstance()
     validationFeatures.sType =
         VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
     validationFeatures.enabledValidationFeatureCount = 1;
-    validationFeatures.pEnabledValidationFeatures   = &bestPracticesEnable;
-    validationFeatures.pNext                         = &debugCreateInfo;
+    validationFeatures.pEnabledValidationFeatures = &bestPracticesEnable;
+    validationFeatures.pNext = &debugCreateInfo;
 
     createInfo.pNext = &validationFeatures;
 #endif
@@ -947,23 +1051,44 @@ void SplatCoreApp::createRenderPass()
     colorAttachmentRef.attachment = 0;
     colorAttachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
+    VkAttachmentDescription depthAttachment{};
+    depthAttachment.format = findDepthFormat();
+    depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    depthAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference depthAttachmentRef{};
+    depthAttachmentRef.attachment = 1;
+    depthAttachmentRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
     VkSubpassDescription subpass{};
     subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     subpass.colorAttachmentCount = 1;
     subpass.pColorAttachments = &colorAttachmentRef;
+    subpass.pDepthStencilAttachment = &depthAttachmentRef;
 
     VkSubpassDependency dependency{};
     dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
     dependency.dstSubpass = 0;
-    dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                              VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
     dependency.srcAccessMask = 0;
-    dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                              VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                               VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+    const std::array<VkAttachmentDescription, 2> attachments = {
+        colorAttachment, depthAttachment};
 
     VkRenderPassCreateInfo renderPassInfo{};
     renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-    renderPassInfo.attachmentCount = 1;
-    renderPassInfo.pAttachments = &colorAttachment;
+    renderPassInfo.attachmentCount = static_cast<uint32_t>(attachments.size());
+    renderPassInfo.pAttachments = attachments.data();
     renderPassInfo.subpassCount = 1;
     renderPassInfo.pSubpasses = &subpass;
     renderPassInfo.dependencyCount = 1;
@@ -981,13 +1106,14 @@ void SplatCoreApp::createFramebuffers()
 
     for (size_t i = 0; i < swapChainImageViews.size(); ++i)
     {
-        VkImageView attachments[] = {swapChainImageViews[i]};
+        const std::array<VkImageView, 2> attachments = {
+            swapChainImageViews[i], depthImageView};
 
         VkFramebufferCreateInfo framebufferInfo{};
         framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
         framebufferInfo.renderPass = renderPass;
-        framebufferInfo.attachmentCount = 1;
-        framebufferInfo.pAttachments = attachments;
+        framebufferInfo.attachmentCount = static_cast<uint32_t>(attachments.size());
+        framebufferInfo.pAttachments = attachments.data();
         framebufferInfo.width = swapChainExtent.width;
         framebufferInfo.height = swapChainExtent.height;
         framebufferInfo.layers = 1;
@@ -1091,20 +1217,21 @@ void SplatCoreApp::recordCommandBuffer(VkCommandBuffer cmdBuffer, uint32_t image
     renderPassInfo.renderArea.offset = {0, 0};
     renderPassInfo.renderArea.extent = swapChainExtent;
 
-    VkClearValue clearColor = {{{0.1f, 0.1f, 0.2f, 1.0f}}};
-    // Red test color (manual toggle): VkClearValue clearColor = {{{1.0f, 0.0f, 0.0f, 1.0f}}};
-    renderPassInfo.clearValueCount = 1;
-    renderPassInfo.pClearValues = &clearColor;
+    std::array<VkClearValue, 2> clearValues{};
+    clearValues[0].color = {{0.05f, 0.05f, 0.1f, 1.0f}};
+    clearValues[1].depthStencil = {1.0f, 0};
+    renderPassInfo.clearValueCount = static_cast<uint32_t>(clearValues.size());
+    renderPassInfo.pClearValues = clearValues.data();
 
     vkCmdBeginRenderPass(cmdBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 
     vkCmdBindPipeline(cmdBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
 
     VkViewport viewport{};
-    viewport.x        = 0.0f;
-    viewport.y        = 0.0f;
-    viewport.width    = static_cast<float>(swapChainExtent.width);
-    viewport.height   = static_cast<float>(swapChainExtent.height);
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = static_cast<float>(swapChainExtent.width);
+    viewport.height = static_cast<float>(swapChainExtent.height);
     viewport.minDepth = 0.0f;
     viewport.maxDepth = 1.0f;
     vkCmdSetViewport(cmdBuffer, 0, 1, &viewport);
@@ -1114,25 +1241,20 @@ void SplatCoreApp::recordCommandBuffer(VkCommandBuffer cmdBuffer, uint32_t image
     scissor.extent = swapChainExtent;
     vkCmdSetScissor(cmdBuffer, 0, 1, &scissor);
 
-    // Bind vertex buffer
-    const VkBuffer     vertexBuffers[] = {vertexBuffer};
-    const VkDeviceSize offsets[]       = {0};
+    // Bind point cloud vertex buffer
+    const VkBuffer vertexBuffers[] = {pointVertexBuffer};
+    const VkDeviceSize offsets[] = {0};
     vkCmdBindVertexBuffers(cmdBuffer, 0, 1, vertexBuffers, offsets);
 
-    // Bind index buffer (uint32_t indices)
-    vkCmdBindIndexBuffer(cmdBuffer, indexBuffer, 0, VK_INDEX_TYPE_UINT32);
-
-    // Bind descriptor set (UBO)
+    // Bind descriptor set (UBO with camera MVP)
     vkCmdBindDescriptorSets(cmdBuffer,
-        VK_PIPELINE_BIND_POINT_GRAPHICS,
-        pipelineLayout,
-        0, 1, &descriptorSets[currentFrame],
-        0, nullptr);
+                            VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            pipelineLayout,
+                            0, 1, &descriptorSets[currentFrame],
+                            0, nullptr);
 
-    // Draw indexed cube (36 indices = 12 triangles = 6 faces)
-    vkCmdDrawIndexed(cmdBuffer,
-        static_cast<uint32_t>(kCubeIndices.size()),
-        1, 0, 0, 0);
+    // Draw all points
+    vkCmdDraw(cmdBuffer, pointCount, 1, 0, 0);
 
     vkCmdEndRenderPass(cmdBuffer);
 
@@ -1159,9 +1281,9 @@ std::vector<char> SplatCoreApp::readSpvFile(const std::string &filename)
 VkShaderModule SplatCoreApp::createShaderModule(const std::vector<char> &code)
 {
     VkShaderModuleCreateInfo createInfo{};
-    createInfo.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    createInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     createInfo.codeSize = code.size();
-    createInfo.pCode    = reinterpret_cast<const uint32_t *>(code.data());
+    createInfo.pCode = reinterpret_cast<const uint32_t *>(code.data());
 
     VkShaderModule shaderModule = VK_NULL_HANDLE;
     if (vkCreateShaderModule(device, &createInfo, nullptr, &shaderModule) != VK_SUCCESS)
@@ -1175,65 +1297,65 @@ void SplatCoreApp::createGraphicsPipeline()
 {
     // SHADER_DIR is injected by CMake as an absolute path string.
     const std::string shaderDir = SHADER_DIR;
-    const std::vector<char> vertCode = readSpvFile(shaderDir + "cube.vert.spv");
-    const std::vector<char> fragCode = readSpvFile(shaderDir + "cube.frag.spv");
+    const std::vector<char> vertCode = readSpvFile(shaderDir + "point.vert.spv");
+    const std::vector<char> fragCode = readSpvFile(shaderDir + "point.frag.spv");
 
     VkShaderModule vertShaderModule = createShaderModule(vertCode);
     VkShaderModule fragShaderModule = createShaderModule(fragCode);
 
     VkPipelineShaderStageCreateInfo vertStageInfo{};
-    vertStageInfo.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    vertStageInfo.stage  = VK_SHADER_STAGE_VERTEX_BIT;
+    vertStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    vertStageInfo.stage = VK_SHADER_STAGE_VERTEX_BIT;
     vertStageInfo.module = vertShaderModule;
-    vertStageInfo.pName  = "main";
+    vertStageInfo.pName = "main";
 
     VkPipelineShaderStageCreateInfo fragStageInfo{};
-    fragStageInfo.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    fragStageInfo.stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
+    fragStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    fragStageInfo.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     fragStageInfo.module = fragShaderModule;
-    fragStageInfo.pName  = "main";
+    fragStageInfo.pName = "main";
 
     const VkPipelineShaderStageCreateInfo shaderStages[] = {
         vertStageInfo, fragStageInfo};
 
     // Vertex input: one binding, two attributes (position + color).
-    const auto bindingDescription    = Vertex::getBindingDescription();
+    const auto bindingDescription = Vertex::getBindingDescription();
     const auto attributeDescriptions = Vertex::getAttributeDescriptions();
 
     VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
     vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vertexInputInfo.vertexBindingDescriptionCount   = 1;
-    vertexInputInfo.pVertexBindingDescriptions      = &bindingDescription;
+    vertexInputInfo.vertexBindingDescriptionCount = 1;
+    vertexInputInfo.pVertexBindingDescriptions = &bindingDescription;
     vertexInputInfo.vertexAttributeDescriptionCount =
         static_cast<uint32_t>(attributeDescriptions.size());
-    vertexInputInfo.pVertexAttributeDescriptions    = attributeDescriptions.data();
+    vertexInputInfo.pVertexAttributeDescriptions = attributeDescriptions.data();
 
     VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
-    inputAssembly.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
     inputAssembly.primitiveRestartEnable = VK_FALSE;
 
     // Dynamic viewport and scissor — set per-frame in recordCommandBuffer().
     VkPipelineViewportStateCreateInfo viewportState{};
-    viewportState.sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
     viewportState.viewportCount = 1;
-    viewportState.pViewports    = nullptr;  // set dynamically
-    viewportState.scissorCount  = 1;
-    viewportState.pScissors     = nullptr;  // set dynamically
+    viewportState.pViewports = nullptr; // set dynamically
+    viewportState.scissorCount = 1;
+    viewportState.pScissors = nullptr; // set dynamically
 
     VkPipelineRasterizationStateCreateInfo rasterizer{};
-    rasterizer.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rasterizer.depthClampEnable        = VK_FALSE;
+    rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterizer.depthClampEnable = VK_FALSE;
     rasterizer.rasterizerDiscardEnable = VK_FALSE;
-    rasterizer.polygonMode             = VK_POLYGON_MODE_FILL;
-    rasterizer.lineWidth               = 1.0f;
-    rasterizer.cullMode                = VK_CULL_MODE_BACK_BIT;
-    rasterizer.frontFace               = VK_FRONT_FACE_CLOCKWISE;
-    rasterizer.depthBiasEnable         = VK_FALSE;
+    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizer.lineWidth = 1.0f;
+    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+    rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
+    rasterizer.depthBiasEnable = VK_FALSE;
 
     VkPipelineMultisampleStateCreateInfo multisampling{};
-    multisampling.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    multisampling.sampleShadingEnable  = VK_FALSE;
+    multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisampling.sampleShadingEnable = VK_FALSE;
     multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
     VkPipelineColorBlendAttachmentState colorBlendAttachment{};
@@ -1243,16 +1365,16 @@ void SplatCoreApp::createGraphicsPipeline()
     colorBlendAttachment.blendEnable = VK_FALSE;
 
     VkPipelineColorBlendStateCreateInfo colorBlending{};
-    colorBlending.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    colorBlending.logicOpEnable   = VK_FALSE;
+    colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlending.logicOpEnable = VK_FALSE;
     colorBlending.attachmentCount = 1;
-    colorBlending.pAttachments    = &colorBlendAttachment;
+    colorBlending.pAttachments = &colorBlendAttachment;
 
     VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
-    pipelineLayoutInfo.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    pipelineLayoutInfo.setLayoutCount          = 1;
-    pipelineLayoutInfo.pSetLayouts             = &descriptorSetLayout;
-    pipelineLayoutInfo.pushConstantRangeCount  = 0;
+    pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pipelineLayoutInfo.setLayoutCount = 1;
+    pipelineLayoutInfo.pSetLayouts = &descriptorSetLayout;
+    pipelineLayoutInfo.pushConstantRangeCount = 0;
 
     if (vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr,
                                &pipelineLayout) != VK_SUCCESS)
@@ -1264,31 +1386,38 @@ void SplatCoreApp::createGraphicsPipeline()
     }
 
     VkGraphicsPipelineCreateInfo pipelineInfo{};
-    pipelineInfo.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pipelineInfo.stageCount          = 2;
-    pipelineInfo.pStages             = shaderStages;
-    pipelineInfo.pVertexInputState   = &vertexInputInfo;
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineInfo.stageCount = 2;
+    pipelineInfo.pStages = shaderStages;
+    pipelineInfo.pVertexInputState = &vertexInputInfo;
     pipelineInfo.pInputAssemblyState = &inputAssembly;
-    pipelineInfo.pViewportState      = &viewportState;
+    pipelineInfo.pViewportState = &viewportState;
     pipelineInfo.pRasterizationState = &rasterizer;
-    pipelineInfo.pMultisampleState   = &multisampling;
-    pipelineInfo.pDepthStencilState  = nullptr;
-    pipelineInfo.pColorBlendState    = &colorBlending;
+    pipelineInfo.pMultisampleState = &multisampling;
+    VkPipelineDepthStencilStateCreateInfo depthStencil{};
+    depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depthStencil.depthTestEnable = VK_TRUE;
+    depthStencil.depthWriteEnable = VK_TRUE;
+    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+    depthStencil.depthBoundsTestEnable = VK_FALSE;
+    depthStencil.stencilTestEnable = VK_FALSE;
+
+    pipelineInfo.pDepthStencilState = &depthStencil;
+    pipelineInfo.pColorBlendState = &colorBlending;
     const VkDynamicState dynamicStates[] = {
         VK_DYNAMIC_STATE_VIEWPORT,
-        VK_DYNAMIC_STATE_SCISSOR
-    };
+        VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dynamicStateInfo{};
-    dynamicStateInfo.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamicStateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
     dynamicStateInfo.dynamicStateCount = 2;
-    dynamicStateInfo.pDynamicStates    = dynamicStates;
+    dynamicStateInfo.pDynamicStates = dynamicStates;
 
     pipelineInfo.pDynamicState = &dynamicStateInfo;
-    pipelineInfo.layout              = pipelineLayout;
-    pipelineInfo.renderPass          = renderPass;
-    pipelineInfo.subpass             = 0;
-    pipelineInfo.basePipelineHandle  = VK_NULL_HANDLE;
-    pipelineInfo.basePipelineIndex   = -1;
+    pipelineInfo.layout = pipelineLayout;
+    pipelineInfo.renderPass = renderPass;
+    pipelineInfo.subpass = 0;
+    pipelineInfo.basePipelineHandle = VK_NULL_HANDLE;
+    pipelineInfo.basePipelineIndex = -1;
 
     const VkResult result = vkCreateGraphicsPipelines(
         device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &graphicsPipeline);
@@ -1308,16 +1437,16 @@ void SplatCoreApp::createGraphicsPipeline()
 void SplatCoreApp::createDescriptorSetLayout()
 {
     VkDescriptorSetLayoutBinding uboLayoutBinding{};
-    uboLayoutBinding.binding            = 0;
-    uboLayoutBinding.descriptorType     = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    uboLayoutBinding.descriptorCount    = 1;
-    uboLayoutBinding.stageFlags         = VK_SHADER_STAGE_VERTEX_BIT;
+    uboLayoutBinding.binding = 0;
+    uboLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    uboLayoutBinding.descriptorCount = 1;
+    uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     uboLayoutBinding.pImmutableSamplers = nullptr;
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
-    layoutInfo.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     layoutInfo.bindingCount = 1;
-    layoutInfo.pBindings    = &uboLayoutBinding;
+    layoutInfo.pBindings = &uboLayoutBinding;
 
     if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr,
                                     &descriptorSetLayout) != VK_SUCCESS)
@@ -1352,9 +1481,9 @@ void SplatCoreApp::createBuffer(VkDeviceSize size,
                                 VkDeviceMemory &bufferMemory)
 {
     VkBufferCreateInfo bufferInfo{};
-    bufferInfo.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufferInfo.size        = size;
-    bufferInfo.usage       = usage;
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = size;
+    bufferInfo.usage = usage;
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
     if (vkCreateBuffer(device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS)
@@ -1366,8 +1495,8 @@ void SplatCoreApp::createBuffer(VkDeviceSize size,
     vkGetBufferMemoryRequirements(device, buffer, &memRequirements);
 
     VkMemoryAllocateInfo allocInfo{};
-    allocInfo.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.allocationSize  = memRequirements.size;
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memRequirements.size;
     allocInfo.memoryTypeIndex = findMemoryType(
         memRequirements.memoryTypeBits, properties);
 
@@ -1383,9 +1512,9 @@ void SplatCoreApp::createBuffer(VkDeviceSize size,
 VkCommandBuffer SplatCoreApp::beginSingleTimeCommands()
 {
     VkCommandBufferAllocateInfo allocInfo{};
-    allocInfo.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandPool        = commandPool;
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandPool = commandPool;
     allocInfo.commandBufferCount = 1;
 
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
@@ -1404,9 +1533,9 @@ void SplatCoreApp::endSingleTimeCommands(VkCommandBuffer commandBuffer)
     vkEndCommandBuffer(commandBuffer);
 
     VkSubmitInfo submitInfo{};
-    submitInfo.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers    = &commandBuffer;
+    submitInfo.pCommandBuffers = &commandBuffer;
 
     vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
     vkQueueWaitIdle(graphicsQueue);
@@ -1428,68 +1557,334 @@ void SplatCoreApp::copyBuffer(VkBuffer srcBuffer,
     endSingleTimeCommands(commandBuffer);
 }
 
-// ── Vertex buffer (DEVICE_LOCAL via staging) ─────────────────────────────
-void SplatCoreApp::createVertexBuffer()
+// ── Image creation helper ─────────────────────────────────────────────────
+void SplatCoreApp::createImage(uint32_t width, uint32_t height,
+                               VkFormat format, VkImageTiling tiling,
+                               VkImageUsageFlags usage,
+                               VkMemoryPropertyFlags properties,
+                               VkImage &image, VkDeviceMemory &imageMemory)
 {
-    const VkDeviceSize bufferSize =
-        sizeof(kCubeVertices[0]) * kCubeVertices.size();
+    VkImageCreateInfo imageInfo{};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.extent.width = width;
+    imageInfo.extent.height = height;
+    imageInfo.extent.depth = 1;
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.format = format;
+    imageInfo.tiling = tiling;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    imageInfo.usage = usage;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-    // Staging buffer: CPU-visible, write vertex data here.
-    VkBuffer       stagingBuffer       = VK_NULL_HANDLE;
-    VkDeviceMemory stagingBufferMemory = VK_NULL_HANDLE;
-    createBuffer(bufferSize,
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        stagingBuffer, stagingBufferMemory);
+    if (vkCreateImage(device, &imageInfo, nullptr, &image) != VK_SUCCESS)
+        throw std::runtime_error("Failed to create image.");
 
-    void *data = nullptr;
-    vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);
-    std::memcpy(data, kCubeVertices.data(), static_cast<size_t>(bufferSize));
-    vkUnmapMemory(device, stagingBufferMemory);
+    VkMemoryRequirements memReq{};
+    vkGetImageMemoryRequirements(device, image, &memReq);
 
-    // Device-local buffer: GPU-fast, copy from staging.
-    createBuffer(bufferSize,
-        VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        vertexBuffer, vertexBufferMemory);
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memReq.size;
+    allocInfo.memoryTypeIndex = findMemoryType(memReq.memoryTypeBits, properties);
 
-    copyBuffer(stagingBuffer, vertexBuffer, bufferSize);
+    if (vkAllocateMemory(device, &allocInfo, nullptr, &imageMemory) != VK_SUCCESS)
+        throw std::runtime_error("Failed to allocate image memory.");
 
-    vkDestroyBuffer(device, stagingBuffer, nullptr);
-    vkFreeMemory(device, stagingBufferMemory, nullptr);
+    vkBindImageMemory(device, image, imageMemory, 0);
 }
 
-// ── Index buffer (DEVICE_LOCAL via staging) ──────────────────────────────
-void SplatCoreApp::createIndexBuffer()
+VkImageView SplatCoreApp::createImageView(VkImage image, VkFormat format,
+                                          VkImageAspectFlags aspectFlags)
 {
-    const VkDeviceSize bufferSize =
-        sizeof(kCubeIndices[0]) * kCubeIndices.size();
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = format;
+    viewInfo.subresourceRange.aspectMask = aspectFlags;
+    viewInfo.subresourceRange.baseMipLevel = 0;
+    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.baseArrayLayer = 0;
+    viewInfo.subresourceRange.layerCount = 1;
 
-    VkBuffer       stagingBuffer       = VK_NULL_HANDLE;
-    VkDeviceMemory stagingBufferMemory = VK_NULL_HANDLE;
+    VkImageView imageView = VK_NULL_HANDLE;
+    if (vkCreateImageView(device, &viewInfo, nullptr, &imageView) != VK_SUCCESS)
+        throw std::runtime_error("Failed to create image view.");
+    return imageView;
+}
+
+// ── Depth format selection ────────────────────────────────────────────────
+VkFormat SplatCoreApp::findSupportedFormat(
+    const std::vector<VkFormat> &candidates,
+    VkImageTiling tiling,
+    VkFormatFeatureFlags features) const
+{
+    for (VkFormat fmt : candidates)
+    {
+        VkFormatProperties props{};
+        vkGetPhysicalDeviceFormatProperties(physicalDevice, fmt, &props);
+        if (tiling == VK_IMAGE_TILING_LINEAR &&
+            (props.linearTilingFeatures & features) == features)
+            return fmt;
+        if (tiling == VK_IMAGE_TILING_OPTIMAL &&
+            (props.optimalTilingFeatures & features) == features)
+            return fmt;
+    }
+    throw std::runtime_error("Failed to find supported depth format.");
+}
+
+VkFormat SplatCoreApp::findDepthFormat() const
+{
+    return findSupportedFormat(
+        {VK_FORMAT_D32_SFLOAT,
+         VK_FORMAT_D32_SFLOAT_S8_UINT,
+         VK_FORMAT_D24_UNORM_S8_UINT},
+        VK_IMAGE_TILING_OPTIMAL,
+        VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT);
+}
+
+// ── Depth resource creation ───────────────────────────────────────────────
+void SplatCoreApp::createDepthResources()
+{
+    const VkFormat depthFormat = findDepthFormat();
+    createImage(swapChainExtent.width, swapChainExtent.height,
+                depthFormat,
+                VK_IMAGE_TILING_OPTIMAL,
+                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                depthImage, depthImageMemory);
+    depthImageView = createImageView(depthImage, depthFormat,
+                                     VK_IMAGE_ASPECT_DEPTH_BIT);
+}
+
+// ── Binary PLY loader ─────────────────────────────────────────────────────
+void SplatCoreApp::loadPointCloud()
+{
+    if (plyFilePath.empty())
+        throw std::runtime_error("PLY file path not set.");
+
+    std::cout << "[PLY] Loading: " << plyFilePath << std::endl;
+
+    std::ifstream file(plyFilePath, std::ios::binary);
+    if (!file.is_open())
+        throw std::runtime_error("Failed to open PLY file: " + plyFilePath);
+
+    // ── Parse ASCII header ────────────────────────────────────────────────
+    struct PropInfo
+    {
+        std::string name;
+        size_t offset;
+    };
+    std::vector<PropInfo> properties;
+    size_t bytesPerVertex = 0;
+    uint32_t vertexCount = 0;
+    bool isBinary = false;
+
+    std::string line;
+    while (std::getline(file, line))
+    {
+        // Trim Windows CR
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (line == "end_header")
+            break;
+
+        std::istringstream iss(line);
+        std::string token;
+        iss >> token;
+
+        if (token == "format")
+        {
+            std::string fmt;
+            iss >> fmt;
+            isBinary = (fmt == "binary_little_endian" ||
+                        fmt == "binary_big_endian");
+        }
+        else if (token == "element")
+        {
+            std::string elem;
+            iss >> elem;
+            if (elem == "vertex")
+                iss >> vertexCount;
+        }
+        else if (token == "property")
+        {
+            std::string typeStr, nameStr;
+            iss >> typeStr >> nameStr;
+            // All 3DGS properties are float (4 bytes)
+            properties.push_back({nameStr, bytesPerVertex});
+            bytesPerVertex += 4;
+        }
+    }
+
+    if (!isBinary)
+        throw std::runtime_error("Only binary_little_endian PLY is supported.");
+    if (vertexCount == 0)
+        throw std::runtime_error("PLY has no vertices.");
+
+    // Find byte offsets for the six fields we need
+    int offX = -1, offY = -1, offZ = -1;
+    int offR = -1, offG = -1, offB = -1;
+    for (const PropInfo &p : properties)
+    {
+        const int off = static_cast<int>(p.offset);
+        if (p.name == "x")
+            offX = off;
+        else if (p.name == "y")
+            offY = off;
+        else if (p.name == "z")
+            offZ = off;
+        else if (p.name == "f_dc_0")
+            offR = off;
+        else if (p.name == "f_dc_1")
+            offG = off;
+        else if (p.name == "f_dc_2")
+            offB = off;
+    }
+    if (offX < 0 || offY < 0 || offZ < 0)
+        throw std::runtime_error("PLY missing x/y/z properties.");
+
+    // ── Read binary data body ─────────────────────────────────────────────
+    const size_t totalBytes = static_cast<size_t>(vertexCount) * bytesPerVertex;
+    std::vector<char> rawData(totalBytes);
+    file.read(rawData.data(), static_cast<std::streamsize>(totalBytes));
+    if (!file)
+        throw std::runtime_error("PLY binary read failed (truncated?).");
+    file.close();
+
+    std::cout << "[PLY] Parsed " << vertexCount << " vertices ("
+              << (totalBytes >> 20) << " MB raw)" << std::endl;
+
+    // ── Build Vertex array ────────────────────────────────────────────────
+    // SH DC → linear RGB: c = clamp(0.5 + 0.2820947918 * f_dc, 0, 1)
+    constexpr float kSH0 = 0.2820947918f;
+
+    std::vector<Vertex> vertices(vertexCount);
+    for (uint32_t i = 0; i < vertexCount; ++i)
+    {
+        const char *base = rawData.data() +
+                           static_cast<size_t>(i) * bytesPerVertex;
+
+        float x, y, z;
+        std::memcpy(&x, base + offX, sizeof(float));
+        std::memcpy(&y, base + offY, sizeof(float));
+        std::memcpy(&z, base + offZ, sizeof(float));
+
+        float r = 0.5f, g = 0.5f, b = 0.5f; // grey fallback if no color
+        if (offR >= 0)
+        {
+            float v;
+            std::memcpy(&v, base + offR, sizeof(float));
+            r = 0.5f + kSH0 * v;
+        }
+        if (offG >= 0)
+        {
+            float v;
+            std::memcpy(&v, base + offG, sizeof(float));
+            g = 0.5f + kSH0 * v;
+        }
+        if (offB >= 0)
+        {
+            float v;
+            std::memcpy(&v, base + offB, sizeof(float));
+            b = 0.5f + kSH0 * v;
+        }
+
+        vertices[i].pos = {x, y, z};
+        vertices[i].color = {std::clamp(r, 0.0f, 1.0f),
+                             std::clamp(g, 0.0f, 1.0f),
+                             std::clamp(b, 0.0f, 1.0f)};
+    }
+    pointCount = vertexCount;
+
+    // ── Upload via staging buffer ─────────────────────────────────────────
+    const VkDeviceSize bufferSize = sizeof(Vertex) * vertices.size();
+
+    VkBuffer stagingBuf = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMem = VK_NULL_HANDLE;
     createBuffer(bufferSize,
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        stagingBuffer, stagingBufferMemory);
+                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 stagingBuf, stagingMem);
 
     void *data = nullptr;
-    vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);
-    std::memcpy(data, kCubeIndices.data(), static_cast<size_t>(bufferSize));
-    vkUnmapMemory(device, stagingBufferMemory);
+    vkMapMemory(device, stagingMem, 0, bufferSize, 0, &data);
+    std::memcpy(data, vertices.data(), static_cast<size_t>(bufferSize));
+    vkUnmapMemory(device, stagingMem);
 
     createBuffer(bufferSize,
-        VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-            VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        indexBuffer, indexBufferMemory);
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                 pointVertexBuffer, pointVertexBufferMemory);
 
-    copyBuffer(stagingBuffer, indexBuffer, bufferSize);
+    copyBuffer(stagingBuf, pointVertexBuffer, bufferSize);
 
-    vkDestroyBuffer(device, stagingBuffer, nullptr);
-    vkFreeMemory(device, stagingBufferMemory, nullptr);
+    vkDestroyBuffer(device, stagingBuf, nullptr);
+    vkFreeMemory(device, stagingMem, nullptr);
+
+    std::cout << "[PLY] GPU upload complete — " << pointCount << " points, "
+              << (bufferSize >> 20) << " MB VRAM." << std::endl;
+}
+
+// ── Input callbacks ───────────────────────────────────────────────────────
+void SplatCoreApp::cursorPosCallback(GLFWwindow *window,
+                                     double xpos, double ypos)
+{
+    auto *app = reinterpret_cast<SplatCoreApp *>(
+        glfwGetWindowUserPointer(window));
+    if (app == nullptr || !app->mouseCaptured)
+        return;
+
+    if (app->firstMouse)
+    {
+        app->lastMouseX = xpos;
+        app->lastMouseY = ypos;
+        app->firstMouse = false;
+        return;
+    }
+
+    const float dx = static_cast<float>(xpos - app->lastMouseX);
+    const float dy = static_cast<float>(app->lastMouseY - ypos); // Y inverted
+    app->lastMouseX = xpos;
+    app->lastMouseY = ypos;
+    app->camera.processMouse(dx, dy);
+}
+
+void SplatCoreApp::mouseButtonCallback(GLFWwindow *window,
+                                       int button, int action, int /*mods*/)
+{
+    auto *app = reinterpret_cast<SplatCoreApp *>(
+        glfwGetWindowUserPointer(window));
+    if (app == nullptr)
+        return;
+
+    if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS)
+    {
+        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+        app->mouseCaptured = true;
+        app->firstMouse = true;
+    }
+    else if (button == GLFW_MOUSE_BUTTON_RIGHT && action == GLFW_PRESS)
+    {
+        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+        app->mouseCaptured = false;
+    }
+}
+
+void SplatCoreApp::scrollCallback(GLFWwindow *window,
+                                  double /*xoffset*/, double yoffset)
+{
+    auto *app = reinterpret_cast<SplatCoreApp *>(
+        glfwGetWindowUserPointer(window));
+    if (app == nullptr)
+        return;
+    // Scroll up = speed up, scroll down = slow down
+    app->camera.speed = std::clamp(
+        app->camera.speed + static_cast<float>(yoffset) * 0.5f,
+        0.1f, 200.0f);
 }
 
 // ── Uniform buffers (one per frame-in-flight, persistently mapped) ────────
@@ -1504,10 +1899,10 @@ void SplatCoreApp::createUniformBuffers()
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
     {
         createBuffer(bufferSize,
-            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            uniformBuffers[i], uniformBuffersMemory[i]);
+                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     uniformBuffers[i], uniformBuffersMemory[i]);
 
         // Persistent map — never unmap until destroy.
         vkMapMemory(device, uniformBuffersMemory[i], 0, bufferSize,
@@ -1519,14 +1914,14 @@ void SplatCoreApp::createUniformBuffers()
 void SplatCoreApp::createDescriptorPool()
 {
     VkDescriptorPoolSize poolSize{};
-    poolSize.type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     poolSize.descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
 
     VkDescriptorPoolCreateInfo poolInfo{};
-    poolInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.poolSizeCount = 1;
-    poolInfo.pPoolSizes    = &poolSize;
-    poolInfo.maxSets       = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+    poolInfo.pPoolSizes = &poolSize;
+    poolInfo.maxSets = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
 
     if (vkCreateDescriptorPool(device, &poolInfo, nullptr,
                                &descriptorPool) != VK_SUCCESS)
@@ -1542,10 +1937,10 @@ void SplatCoreApp::createDescriptorSets()
         MAX_FRAMES_IN_FLIGHT, descriptorSetLayout);
 
     VkDescriptorSetAllocateInfo allocInfo{};
-    allocInfo.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    allocInfo.descriptorPool     = descriptorPool;
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = descriptorPool;
     allocInfo.descriptorSetCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
-    allocInfo.pSetLayouts        = layouts.data();
+    allocInfo.pSetLayouts = layouts.data();
 
     descriptorSets.resize(MAX_FRAMES_IN_FLIGHT);
     if (vkAllocateDescriptorSets(device, &allocInfo,
@@ -1559,16 +1954,16 @@ void SplatCoreApp::createDescriptorSets()
         VkDescriptorBufferInfo bufferInfo{};
         bufferInfo.buffer = uniformBuffers[i];
         bufferInfo.offset = 0;
-        bufferInfo.range  = sizeof(UniformBufferObject);
+        bufferInfo.range = sizeof(UniformBufferObject);
 
         VkWriteDescriptorSet descriptorWrite{};
-        descriptorWrite.sType            = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        descriptorWrite.dstSet           = descriptorSets[i];
-        descriptorWrite.dstBinding       = 0;
-        descriptorWrite.dstArrayElement  = 0;
-        descriptorWrite.descriptorType   = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        descriptorWrite.descriptorCount  = 1;
-        descriptorWrite.pBufferInfo      = &bufferInfo;
+        descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        descriptorWrite.dstSet = descriptorSets[i];
+        descriptorWrite.dstBinding = 0;
+        descriptorWrite.dstArrayElement = 0;
+        descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        descriptorWrite.descriptorCount = 1;
+        descriptorWrite.pBufferInfo = &bufferInfo;
 
         vkUpdateDescriptorSets(device, 1, &descriptorWrite, 0, nullptr);
     }
@@ -1577,31 +1972,22 @@ void SplatCoreApp::createDescriptorSets()
 // ── MVP matrix update (called once per frame) ────────────────────────────
 void SplatCoreApp::updateUniformBuffer(uint32_t frameIndex)
 {
-    const float time = static_cast<float>(glfwGetTime());
-
     UniformBufferObject ubo{};
 
-    // Rotate around Y-axis at 90 degrees per second.
-    ubo.model = glm::rotate(
-        glm::mat4(1.0f),
-        time * glm::radians(90.0f),
-        glm::vec3(0.0f, 1.0f, 0.0f));
+    // Model: identity — point cloud coordinates are already in world space.
+    ubo.model = glm::mat4(1.0f);
 
-    // Camera at (2, 2, 2) looking at origin, Y-up.
-    ubo.view = glm::lookAt(
-        glm::vec3(2.0f, 2.0f, 2.0f),
-        glm::vec3(0.0f, 0.0f, 0.0f),
-        glm::vec3(0.0f, 1.0f, 0.0f));
+    // View: FPS camera.
+    ubo.view = camera.getView();
 
-    // 45° FOV perspective, aspect from current extent.
+    // Projection: 60° FOV, current aspect ratio, wide depth range for large scenes.
     ubo.proj = glm::perspective(
-        glm::radians(45.0f),
+        glm::radians(60.0f),
         static_cast<float>(swapChainExtent.width) /
             static_cast<float>(swapChainExtent.height),
-        0.1f, 100.0f);
+        0.01f, 1000.0f);
 
-    // GLM is designed for OpenGL (Y up in clip space).
-    // Vulkan's clip space Y is flipped — negate the Y scale.
+    // Vulkan Y-flip.
     ubo.proj[1][1] *= -1.0f;
 
     std::memcpy(uniformBuffersMapped[frameIndex], &ubo, sizeof(ubo));
@@ -1885,11 +2271,19 @@ void SplatCoreApp::destroyDebugUtilsMessengerEXT(
     }
 }
 
-int main()
+int main(int argc, char *argv[])
 {
+    if (argc < 2)
+    {
+        std::cerr << "[Fatal] Usage: SplatCore_SilasHan.exe <path_to_file.ply>"
+                  << std::endl;
+        return EXIT_FAILURE;
+    }
+
     try
     {
         SplatCoreApp app;
+        app.setPlyPath(argv[1]);
         app.run();
     }
     catch (const std::exception &e)
