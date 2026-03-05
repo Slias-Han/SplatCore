@@ -12,6 +12,7 @@ add_compile_definitions(
 
 find_package(Vulkan REQUIRED)
 find_package(glfw3 REQUIRED)
+find_package(glm CONFIG REQUIRED)
 
 # ── Shader compilation ───────────────────────────────────────────────────
 find_program(GLSLC_EXECUTABLE glslc
@@ -25,6 +26,8 @@ file(MAKE_DIRECTORY "${SHADER_BIN_DIR}")
 set(SHADER_SOURCES
     "${SHADER_SRC_DIR}/triangle.vert"
     "${SHADER_SRC_DIR}/triangle.frag"
+    "${SHADER_SRC_DIR}/cube.vert"
+    "${SHADER_SRC_DIR}/cube.frag"
 )
 
 set(SPV_OUTPUTS "")
@@ -49,6 +52,7 @@ add_executable(SplatCore_SilasHan main.cpp)
 target_link_libraries(SplatCore_SilasHan PRIVATE
     Vulkan::Vulkan
     glfw
+    glm::glm
 )
 
 add_dependencies(SplatCore_SilasHan SplatCore_Shaders)

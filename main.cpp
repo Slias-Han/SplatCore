@@ -1,8 +1,15 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
+#define GLM_FORCE_RADIANS
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <fstream>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +21,69 @@
 #include <string>
 #include <vector>
 
+// ── Vertex layout ────────────────────────────────────────────────────────
+struct Vertex
+{
+    glm::vec3 pos;
+    glm::vec3 color;
+
+    static VkVertexInputBindingDescription getBindingDescription()
+    {
+        VkVertexInputBindingDescription binding{};
+        binding.binding   = 0;
+        binding.stride    = sizeof(Vertex);
+        binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+        return binding;
+    }
+
+    static std::array<VkVertexInputAttributeDescription, 2>
+    getAttributeDescriptions()
+    {
+        std::array<VkVertexInputAttributeDescription, 2> attrs{};
+        attrs[0].binding  = 0;
+        attrs[0].location = 0;
+        attrs[0].format   = VK_FORMAT_R32G32B32_SFLOAT;
+        attrs[0].offset   = offsetof(Vertex, pos);
+        attrs[1].binding  = 0;
+        attrs[1].location = 1;
+        attrs[1].format   = VK_FORMAT_R32G32B32_SFLOAT;
+        attrs[1].offset   = offsetof(Vertex, color);
+        return attrs;
+    }
+};
+
+// ── UBO layout (matches cube.vert binding 0) ─────────────────────────────
+struct UniformBufferObject
+{
+    alignas(16) glm::mat4 model;
+    alignas(16) glm::mat4 view;
+    alignas(16) glm::mat4 proj;
+};
+
+// ── Cube geometry ─────────────────────────────────────────────────────────
+static const std::vector<Vertex> kCubeVertices = {
+    // front   (red tones)
+    {{-0.5f, -0.5f,  0.5f}, {1.0f, 0.0f, 0.0f}},
+    {{ 0.5f, -0.5f,  0.5f}, {0.8f, 0.2f, 0.0f}},
+    {{ 0.5f,  0.5f,  0.5f}, {1.0f, 0.4f, 0.0f}},
+    {{-0.5f,  0.5f,  0.5f}, {0.9f, 0.1f, 0.1f}},
+    // back    (blue/cyan tones)
+    {{-0.5f, -0.5f, -0.5f}, {0.0f, 0.4f, 1.0f}},
+    {{ 0.5f, -0.5f, -0.5f}, {0.0f, 1.0f, 0.8f}},
+    {{ 0.5f,  0.5f, -0.5f}, {0.2f, 0.6f, 1.0f}},
+    {{-0.5f,  0.5f, -0.5f}, {0.0f, 0.8f, 1.0f}},
+};
+
+static const std::vector<uint32_t> kCubeIndices = {
+    0, 1, 2,  2, 3, 0,   // front
+    1, 5, 6,  6, 2, 1,   // right
+    5, 4, 7,  7, 6, 5,   // back
+    4, 0, 3,  3, 7, 4,   // left
+    3, 2, 6,  6, 7, 3,   // top
+    4, 5, 1,  1, 0, 4,   // bottom
+};
+// ─────────────────────────────────────────────────────────────────────────
+
 class SplatCoreApp
 {
 public:
@@ -24,7 +94,7 @@ private:
     static constexpr uint32_t kWidth = 800;
     static constexpr uint32_t kHeight = 600;
     static constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
-    static constexpr const char *kWindowTitle = "SplatCore v0.3";
+    static constexpr const char *kWindowTitle = "SplatCore v0.4";
 
 #ifdef VK_ENABLE_VALIDATION_LAYERS
     const std::vector<const char *> validationLayers = {
@@ -77,8 +147,21 @@ private:
     std::vector<VkSemaphore> imageAvailableSemaphores;
     std::vector<VkSemaphore> renderFinishedSemaphores;
     std::vector<VkFence> inFlightFences;
-    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
-    VkPipeline graphicsPipeline    = VK_NULL_HANDLE;
+    VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
+    VkPipelineLayout pipelineLayout           = VK_NULL_HANDLE;
+    VkPipeline graphicsPipeline               = VK_NULL_HANDLE;
+
+    VkBuffer       vertexBuffer       = VK_NULL_HANDLE;
+    VkDeviceMemory vertexBufferMemory = VK_NULL_HANDLE;
+    VkBuffer       indexBuffer        = VK_NULL_HANDLE;
+    VkDeviceMemory indexBufferMemory  = VK_NULL_HANDLE;
+
+    std::vector<VkBuffer>       uniformBuffers;
+    std::vector<VkDeviceMemory> uniformBuffersMemory;
+    std::vector<void *>         uniformBuffersMapped;
+
+    VkDescriptorPool             descriptorPool = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSet> descriptorSets;
     // Stores the currentFrame index (0..MAX_FRAMES_IN_FLIGHT-1)
     // that last submitted to this swapchain image, or kNoFrame.
     static constexpr uint32_t kNoFrame = UINT32_MAX;
@@ -110,7 +193,26 @@ private:
     void createSyncObjects();
     void cleanupSwapChain();
     void recreateSwapChain();
+    void createDescriptorSetLayout();
     void createGraphicsPipeline();
+    void createVertexBuffer();
+    void createIndexBuffer();
+    void createUniformBuffers();
+    void createDescriptorPool();
+    void createDescriptorSets();
+    void updateUniformBuffer(uint32_t frameIndex);
+    uint32_t findMemoryType(uint32_t typeFilter,
+                            VkMemoryPropertyFlags properties) const;
+    void createBuffer(VkDeviceSize size,
+                      VkBufferUsageFlags usage,
+                      VkMemoryPropertyFlags properties,
+                      VkBuffer &buffer,
+                      VkDeviceMemory &bufferMemory);
+    void copyBuffer(VkBuffer srcBuffer,
+                    VkBuffer dstBuffer,
+                    VkDeviceSize size);
+    VkCommandBuffer beginSingleTimeCommands();
+    void endSingleTimeCommands(VkCommandBuffer commandBuffer);
     static void framebufferResizeCallback(GLFWwindow *window,
                                           int width, int height);
     void recordCommandBuffer(VkCommandBuffer cmdBuffer, uint32_t imageIndex);
@@ -190,9 +292,15 @@ void SplatCoreApp::initVulkan()
     createSwapChain();
     createImageViews();
     createRenderPass();
+    createDescriptorSetLayout();   // must exist before pipeline
     createGraphicsPipeline();
     createFramebuffers();
     createCommandPool();
+    createVertexBuffer();          // needs commandPool for staging copy
+    createIndexBuffer();
+    createUniformBuffers();
+    createDescriptorPool();
+    createDescriptorSets();
     createCommandBuffer();
     createSyncObjects();
     failIfValidationIssueDetected();
@@ -332,18 +440,66 @@ void SplatCoreApp::cleanup()
         commandPool = VK_NULL_HANDLE;
     }
 
+    // Descriptor resources
+    if (descriptorPool != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorPool(device, descriptorPool, nullptr);
+        descriptorPool = VK_NULL_HANDLE;
+    }
+    if (descriptorSetLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
+        descriptorSetLayout = VK_NULL_HANDLE;
+    }
+
+    // Uniform buffers (persistently mapped — unmap by destroying)
+    for (size_t i = 0; i < uniformBuffers.size(); ++i)
+    {
+        if (uniformBuffers[i] != VK_NULL_HANDLE)
+        {
+            vkDestroyBuffer(device, uniformBuffers[i], nullptr);
+        }
+        if (uniformBuffersMemory[i] != VK_NULL_HANDLE)
+        {
+            vkFreeMemory(device, uniformBuffersMemory[i], nullptr);
+        }
+    }
+    uniformBuffers.clear();
+    uniformBuffersMemory.clear();
+    uniformBuffersMapped.clear();
+
+    // Geometry buffers
+    if (indexBuffer != VK_NULL_HANDLE)
+    {
+        vkDestroyBuffer(device, indexBuffer, nullptr);
+        indexBuffer = VK_NULL_HANDLE;
+    }
+    if (indexBufferMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(device, indexBufferMemory, nullptr);
+        indexBufferMemory = VK_NULL_HANDLE;
+    }
+    if (vertexBuffer != VK_NULL_HANDLE)
+    {
+        vkDestroyBuffer(device, vertexBuffer, nullptr);
+        vertexBuffer = VK_NULL_HANDLE;
+    }
+    if (vertexBufferMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(device, vertexBufferMemory, nullptr);
+        vertexBufferMemory = VK_NULL_HANDLE;
+    }
+
     if (graphicsPipeline != VK_NULL_HANDLE)
     {
         vkDestroyPipeline(device, graphicsPipeline, nullptr);
         graphicsPipeline = VK_NULL_HANDLE;
     }
-
     if (pipelineLayout != VK_NULL_HANDLE)
     {
         vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
         pipelineLayout = VK_NULL_HANDLE;
     }
-
     if (renderPass != VK_NULL_HANDLE)
     {
         vkDestroyRenderPass(device, renderPass, nullptr);
@@ -443,6 +599,9 @@ void SplatCoreApp::drawFrame()
         }
         imagesInFlight[imageIndex] = currentFrame;
     }
+
+    // 5a) Update MVP matrix for this frame.
+    updateUniformBuffer(currentFrame);
 
     // 5) Record command buffer.
     VkCommandBuffer currentCommandBuffer = commandBuffers[currentFrame];
@@ -955,7 +1114,25 @@ void SplatCoreApp::recordCommandBuffer(VkCommandBuffer cmdBuffer, uint32_t image
     scissor.extent = swapChainExtent;
     vkCmdSetScissor(cmdBuffer, 0, 1, &scissor);
 
-    vkCmdDraw(cmdBuffer, 3, 1, 0, 0);
+    // Bind vertex buffer
+    const VkBuffer     vertexBuffers[] = {vertexBuffer};
+    const VkDeviceSize offsets[]       = {0};
+    vkCmdBindVertexBuffers(cmdBuffer, 0, 1, vertexBuffers, offsets);
+
+    // Bind index buffer (uint32_t indices)
+    vkCmdBindIndexBuffer(cmdBuffer, indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+
+    // Bind descriptor set (UBO)
+    vkCmdBindDescriptorSets(cmdBuffer,
+        VK_PIPELINE_BIND_POINT_GRAPHICS,
+        pipelineLayout,
+        0, 1, &descriptorSets[currentFrame],
+        0, nullptr);
+
+    // Draw indexed cube (36 indices = 12 triangles = 6 faces)
+    vkCmdDrawIndexed(cmdBuffer,
+        static_cast<uint32_t>(kCubeIndices.size()),
+        1, 0, 0, 0);
 
     vkCmdEndRenderPass(cmdBuffer);
 
@@ -998,8 +1175,8 @@ void SplatCoreApp::createGraphicsPipeline()
 {
     // SHADER_DIR is injected by CMake as an absolute path string.
     const std::string shaderDir = SHADER_DIR;
-    const std::vector<char> vertCode = readSpvFile(shaderDir + "triangle.vert.spv");
-    const std::vector<char> fragCode = readSpvFile(shaderDir + "triangle.frag.spv");
+    const std::vector<char> vertCode = readSpvFile(shaderDir + "cube.vert.spv");
+    const std::vector<char> fragCode = readSpvFile(shaderDir + "cube.frag.spv");
 
     VkShaderModule vertShaderModule = createShaderModule(vertCode);
     VkShaderModule fragShaderModule = createShaderModule(fragCode);
@@ -1019,13 +1196,17 @@ void SplatCoreApp::createGraphicsPipeline()
     const VkPipelineShaderStageCreateInfo shaderStages[] = {
         vertStageInfo, fragStageInfo};
 
-    // No vertex buffers — positions and colors are hardcoded in the vertex shader.
+    // Vertex input: one binding, two attributes (position + color).
+    const auto bindingDescription    = Vertex::getBindingDescription();
+    const auto attributeDescriptions = Vertex::getAttributeDescriptions();
+
     VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
     vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vertexInputInfo.vertexBindingDescriptionCount   = 0;
-    vertexInputInfo.pVertexBindingDescriptions      = nullptr;
-    vertexInputInfo.vertexAttributeDescriptionCount = 0;
-    vertexInputInfo.pVertexAttributeDescriptions    = nullptr;
+    vertexInputInfo.vertexBindingDescriptionCount   = 1;
+    vertexInputInfo.pVertexBindingDescriptions      = &bindingDescription;
+    vertexInputInfo.vertexAttributeDescriptionCount =
+        static_cast<uint32_t>(attributeDescriptions.size());
+    vertexInputInfo.pVertexAttributeDescriptions    = attributeDescriptions.data();
 
     VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
     inputAssembly.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
@@ -1069,7 +1250,8 @@ void SplatCoreApp::createGraphicsPipeline()
 
     VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
     pipelineLayoutInfo.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    pipelineLayoutInfo.setLayoutCount          = 0;
+    pipelineLayoutInfo.setLayoutCount          = 1;
+    pipelineLayoutInfo.pSetLayouts             = &descriptorSetLayout;
     pipelineLayoutInfo.pushConstantRangeCount  = 0;
 
     if (vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr,
@@ -1120,6 +1302,309 @@ void SplatCoreApp::createGraphicsPipeline()
     {
         throw std::runtime_error("Failed to create graphics pipeline.");
     }
+}
+
+// ── Descriptor Set Layout ────────────────────────────────────────────────
+void SplatCoreApp::createDescriptorSetLayout()
+{
+    VkDescriptorSetLayoutBinding uboLayoutBinding{};
+    uboLayoutBinding.binding            = 0;
+    uboLayoutBinding.descriptorType     = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    uboLayoutBinding.descriptorCount    = 1;
+    uboLayoutBinding.stageFlags         = VK_SHADER_STAGE_VERTEX_BIT;
+    uboLayoutBinding.pImmutableSamplers = nullptr;
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutInfo.bindingCount = 1;
+    layoutInfo.pBindings    = &uboLayoutBinding;
+
+    if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr,
+                                    &descriptorSetLayout) != VK_SUCCESS)
+    {
+        throw std::runtime_error("Failed to create descriptor set layout.");
+    }
+}
+
+// ── Memory utility ───────────────────────────────────────────────────────
+uint32_t SplatCoreApp::findMemoryType(uint32_t typeFilter,
+                                      VkMemoryPropertyFlags properties) const
+{
+    VkPhysicalDeviceMemoryProperties memProperties{};
+    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProperties);
+
+    for (uint32_t i = 0; i < memProperties.memoryTypeCount; ++i)
+    {
+        if ((typeFilter & (1U << i)) != 0U &&
+            (memProperties.memoryTypes[i].propertyFlags & properties) == properties)
+        {
+            return i;
+        }
+    }
+    throw std::runtime_error("Failed to find suitable memory type.");
+}
+
+// ── Generic buffer creator ───────────────────────────────────────────────
+void SplatCoreApp::createBuffer(VkDeviceSize size,
+                                VkBufferUsageFlags usage,
+                                VkMemoryPropertyFlags properties,
+                                VkBuffer &buffer,
+                                VkDeviceMemory &bufferMemory)
+{
+    VkBufferCreateInfo bufferInfo{};
+    bufferInfo.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size        = size;
+    bufferInfo.usage       = usage;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    if (vkCreateBuffer(device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS)
+    {
+        throw std::runtime_error("Failed to create buffer.");
+    }
+
+    VkMemoryRequirements memRequirements{};
+    vkGetBufferMemoryRequirements(device, buffer, &memRequirements);
+
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize  = memRequirements.size;
+    allocInfo.memoryTypeIndex = findMemoryType(
+        memRequirements.memoryTypeBits, properties);
+
+    if (vkAllocateMemory(device, &allocInfo, nullptr, &bufferMemory) != VK_SUCCESS)
+    {
+        throw std::runtime_error("Failed to allocate buffer memory.");
+    }
+
+    vkBindBufferMemory(device, buffer, bufferMemory, 0);
+}
+
+// ── Single-time command helpers ──────────────────────────────────────────
+VkCommandBuffer SplatCoreApp::beginSingleTimeCommands()
+{
+    VkCommandBufferAllocateInfo allocInfo{};
+    allocInfo.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandPool        = commandPool;
+    allocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer);
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+    return commandBuffer;
+}
+
+void SplatCoreApp::endSingleTimeCommands(VkCommandBuffer commandBuffer)
+{
+    vkEndCommandBuffer(commandBuffer);
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers    = &commandBuffer;
+
+    vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(graphicsQueue);
+
+    vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
+}
+
+// ── Buffer copy ──────────────────────────────────────────────────────────
+void SplatCoreApp::copyBuffer(VkBuffer srcBuffer,
+                              VkBuffer dstBuffer,
+                              VkDeviceSize size)
+{
+    VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+    VkBufferCopy copyRegion{};
+    copyRegion.size = size;
+    vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+
+    endSingleTimeCommands(commandBuffer);
+}
+
+// ── Vertex buffer (DEVICE_LOCAL via staging) ─────────────────────────────
+void SplatCoreApp::createVertexBuffer()
+{
+    const VkDeviceSize bufferSize =
+        sizeof(kCubeVertices[0]) * kCubeVertices.size();
+
+    // Staging buffer: CPU-visible, write vertex data here.
+    VkBuffer       stagingBuffer       = VK_NULL_HANDLE;
+    VkDeviceMemory stagingBufferMemory = VK_NULL_HANDLE;
+    createBuffer(bufferSize,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        stagingBuffer, stagingBufferMemory);
+
+    void *data = nullptr;
+    vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);
+    std::memcpy(data, kCubeVertices.data(), static_cast<size_t>(bufferSize));
+    vkUnmapMemory(device, stagingBufferMemory);
+
+    // Device-local buffer: GPU-fast, copy from staging.
+    createBuffer(bufferSize,
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        vertexBuffer, vertexBufferMemory);
+
+    copyBuffer(stagingBuffer, vertexBuffer, bufferSize);
+
+    vkDestroyBuffer(device, stagingBuffer, nullptr);
+    vkFreeMemory(device, stagingBufferMemory, nullptr);
+}
+
+// ── Index buffer (DEVICE_LOCAL via staging) ──────────────────────────────
+void SplatCoreApp::createIndexBuffer()
+{
+    const VkDeviceSize bufferSize =
+        sizeof(kCubeIndices[0]) * kCubeIndices.size();
+
+    VkBuffer       stagingBuffer       = VK_NULL_HANDLE;
+    VkDeviceMemory stagingBufferMemory = VK_NULL_HANDLE;
+    createBuffer(bufferSize,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        stagingBuffer, stagingBufferMemory);
+
+    void *data = nullptr;
+    vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);
+    std::memcpy(data, kCubeIndices.data(), static_cast<size_t>(bufferSize));
+    vkUnmapMemory(device, stagingBufferMemory);
+
+    createBuffer(bufferSize,
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+            VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        indexBuffer, indexBufferMemory);
+
+    copyBuffer(stagingBuffer, indexBuffer, bufferSize);
+
+    vkDestroyBuffer(device, stagingBuffer, nullptr);
+    vkFreeMemory(device, stagingBufferMemory, nullptr);
+}
+
+// ── Uniform buffers (one per frame-in-flight, persistently mapped) ────────
+void SplatCoreApp::createUniformBuffers()
+{
+    const VkDeviceSize bufferSize = sizeof(UniformBufferObject);
+
+    uniformBuffers.resize(MAX_FRAMES_IN_FLIGHT, VK_NULL_HANDLE);
+    uniformBuffersMemory.resize(MAX_FRAMES_IN_FLIGHT, VK_NULL_HANDLE);
+    uniformBuffersMapped.resize(MAX_FRAMES_IN_FLIGHT, nullptr);
+
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
+    {
+        createBuffer(bufferSize,
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            uniformBuffers[i], uniformBuffersMemory[i]);
+
+        // Persistent map — never unmap until destroy.
+        vkMapMemory(device, uniformBuffersMemory[i], 0, bufferSize,
+                    0, &uniformBuffersMapped[i]);
+    }
+}
+
+// ── Descriptor pool ──────────────────────────────────────────────────────
+void SplatCoreApp::createDescriptorPool()
+{
+    VkDescriptorPoolSize poolSize{};
+    poolSize.type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    poolSize.descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+
+    VkDescriptorPoolCreateInfo poolInfo{};
+    poolInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.poolSizeCount = 1;
+    poolInfo.pPoolSizes    = &poolSize;
+    poolInfo.maxSets       = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+
+    if (vkCreateDescriptorPool(device, &poolInfo, nullptr,
+                               &descriptorPool) != VK_SUCCESS)
+    {
+        throw std::runtime_error("Failed to create descriptor pool.");
+    }
+}
+
+// ── Descriptor sets ──────────────────────────────────────────────────────
+void SplatCoreApp::createDescriptorSets()
+{
+    std::vector<VkDescriptorSetLayout> layouts(
+        MAX_FRAMES_IN_FLIGHT, descriptorSetLayout);
+
+    VkDescriptorSetAllocateInfo allocInfo{};
+    allocInfo.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool     = descriptorPool;
+    allocInfo.descriptorSetCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+    allocInfo.pSetLayouts        = layouts.data();
+
+    descriptorSets.resize(MAX_FRAMES_IN_FLIGHT);
+    if (vkAllocateDescriptorSets(device, &allocInfo,
+                                 descriptorSets.data()) != VK_SUCCESS)
+    {
+        throw std::runtime_error("Failed to allocate descriptor sets.");
+    }
+
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
+    {
+        VkDescriptorBufferInfo bufferInfo{};
+        bufferInfo.buffer = uniformBuffers[i];
+        bufferInfo.offset = 0;
+        bufferInfo.range  = sizeof(UniformBufferObject);
+
+        VkWriteDescriptorSet descriptorWrite{};
+        descriptorWrite.sType            = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        descriptorWrite.dstSet           = descriptorSets[i];
+        descriptorWrite.dstBinding       = 0;
+        descriptorWrite.dstArrayElement  = 0;
+        descriptorWrite.descriptorType   = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        descriptorWrite.descriptorCount  = 1;
+        descriptorWrite.pBufferInfo      = &bufferInfo;
+
+        vkUpdateDescriptorSets(device, 1, &descriptorWrite, 0, nullptr);
+    }
+}
+
+// ── MVP matrix update (called once per frame) ────────────────────────────
+void SplatCoreApp::updateUniformBuffer(uint32_t frameIndex)
+{
+    const float time = static_cast<float>(glfwGetTime());
+
+    UniformBufferObject ubo{};
+
+    // Rotate around Y-axis at 90 degrees per second.
+    ubo.model = glm::rotate(
+        glm::mat4(1.0f),
+        time * glm::radians(90.0f),
+        glm::vec3(0.0f, 1.0f, 0.0f));
+
+    // Camera at (2, 2, 2) looking at origin, Y-up.
+    ubo.view = glm::lookAt(
+        glm::vec3(2.0f, 2.0f, 2.0f),
+        glm::vec3(0.0f, 0.0f, 0.0f),
+        glm::vec3(0.0f, 1.0f, 0.0f));
+
+    // 45° FOV perspective, aspect from current extent.
+    ubo.proj = glm::perspective(
+        glm::radians(45.0f),
+        static_cast<float>(swapChainExtent.width) /
+            static_cast<float>(swapChainExtent.height),
+        0.1f, 100.0f);
+
+    // GLM is designed for OpenGL (Y up in clip space).
+    // Vulkan's clip space Y is flipped — negate the Y scale.
+    ubo.proj[1][1] *= -1.0f;
+
+    std::memcpy(uniformBuffersMapped[frameIndex], &ubo, sizeof(ubo));
 }
 
 bool SplatCoreApp::checkValidationLayerSupport() const
@@ -1352,6 +1837,11 @@ VKAPI_ATTR VkBool32 VKAPI_CALL SplatCoreApp::debugCallback(
     {
         // Ignore duplicate implicit-layer noise emitted by some launcher overlays.
         if (std::strstr(message, "Removing layer VK_LAYER_EOS_Overlay") != nullptr)
+        {
+            return VK_FALSE;
+        }
+        // Ignore BestPractices small-allocation advisory for tiny demo buffers.
+        if (std::strstr(message, "should be sub-allocated from larger memory blocks") != nullptr)
         {
             return VK_FALSE;
         }
