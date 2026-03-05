@@ -3,6 +3,8 @@ A high-performance, hardware-accelerated 3D Gaussian Splatting engine engineered
 
 ## Changelog
 
+## v0.3 - Resize stabilization, BestPractices clean, FPS display
+
 ## v0.2 - RGB gradient triangle, graphics pipeline
 
 ### v0.1 - Hello Vulkan

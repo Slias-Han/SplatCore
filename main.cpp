@@ -24,7 +24,7 @@ private:
     static constexpr uint32_t kWidth = 800;
     static constexpr uint32_t kHeight = 600;
     static constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
-    static constexpr const char *kWindowTitle = "SplatCore v0.1";
+    static constexpr const char *kWindowTitle = "SplatCore v0.3";
 
 #ifdef VK_ENABLE_VALIDATION_LAYERS
     const std::vector<const char *> validationLayers = {
@@ -84,6 +84,9 @@ private:
     static constexpr uint32_t kNoFrame = UINT32_MAX;
     std::vector<uint32_t> imagesInFlight;
     uint32_t currentFrame = 0;
+    bool framebufferResized = false;
+    double lastFpsTime     = 0.0;
+    uint32_t frameCount    = 0;
 
     std::atomic<bool> validationErrorDetected{false};
     std::string validationErrorMessage;
@@ -105,7 +108,11 @@ private:
     void createCommandPool();
     void createCommandBuffer();
     void createSyncObjects();
+    void cleanupSwapChain();
+    void recreateSwapChain();
     void createGraphicsPipeline();
+    static void framebufferResizeCallback(GLFWwindow *window,
+                                          int width, int height);
     void recordCommandBuffer(VkCommandBuffer cmdBuffer, uint32_t imageIndex);
     static std::vector<char> readSpvFile(const std::string &filename);
     VkShaderModule createShaderModule(const std::vector<char> &code);
@@ -159,13 +166,16 @@ void SplatCoreApp::initWindow()
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_DECORATED, GLFW_TRUE);
     glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);
-    glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+    glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
 
     window = glfwCreateWindow(static_cast<int>(kWidth), static_cast<int>(kHeight), kWindowTitle, nullptr, nullptr);
     if (window == nullptr)
     {
         throw std::runtime_error("Failed to create GLFW window.");
     }
+    glfwSetWindowUserPointer(window, this);
+    glfwSetFramebufferSizeCallback(window, framebufferResizeCallback);
+    lastFpsTime = glfwGetTime();
 }
 
 void SplatCoreApp::initVulkan()
@@ -198,6 +208,84 @@ void SplatCoreApp::mainLoop()
     if (vkDeviceWaitIdle(device) != VK_SUCCESS)
     {
         throw std::runtime_error("vkDeviceWaitIdle failed.");
+    }
+}
+
+void SplatCoreApp::cleanupSwapChain()
+{
+    for (VkFramebuffer framebuffer : swapChainFramebuffers)
+    {
+        vkDestroyFramebuffer(device, framebuffer, nullptr);
+    }
+    swapChainFramebuffers.clear();
+
+    for (VkImageView imageView : swapChainImageViews)
+    {
+        vkDestroyImageView(device, imageView, nullptr);
+    }
+    swapChainImageViews.clear();
+
+    if (swapChain != VK_NULL_HANDLE)
+    {
+        vkDestroySwapchainKHR(device, swapChain, nullptr);
+        swapChain = VK_NULL_HANDLE;
+    }
+}
+
+void SplatCoreApp::recreateSwapChain()
+{
+    // Handle minimize: wait until window has non-zero size.
+    int width = 0;
+    int height = 0;
+    glfwGetFramebufferSize(window, &width, &height);
+    while (width == 0 || height == 0)
+    {
+        glfwGetFramebufferSize(window, &width, &height);
+        glfwWaitEvents();
+    }
+
+    vkDeviceWaitIdle(device);
+
+    cleanupSwapChain();
+
+    // Rebuild swapchain-dependent resources.
+    createSwapChain();
+    createImageViews();
+    createFramebuffers();
+
+    // renderFinishedSemaphores are sized by swapchain image count,
+    // which may have changed — destroy old ones and recreate.
+    for (VkSemaphore semaphore : renderFinishedSemaphores)
+    {
+        vkDestroySemaphore(device, semaphore, nullptr);
+    }
+    renderFinishedSemaphores.clear();
+
+    renderFinishedSemaphores.resize(swapChainImages.size());
+    VkSemaphoreCreateInfo semaphoreInfo{};
+    semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    for (size_t i = 0; i < swapChainImages.size(); ++i)
+    {
+        if (vkCreateSemaphore(device, &semaphoreInfo, nullptr,
+                              &renderFinishedSemaphores[i]) != VK_SUCCESS)
+        {
+            throw std::runtime_error(
+                "Failed to recreate renderFinished semaphore.");
+        }
+    }
+
+    // imagesInFlight tracks per-image usage; reset for new image set.
+    imagesInFlight.assign(swapChainImages.size(), kNoFrame);
+}
+
+void SplatCoreApp::framebufferResizeCallback(
+    GLFWwindow *window, int /*width*/, int /*height*/)
+{
+    auto *app = reinterpret_cast<SplatCoreApp *>(
+        glfwGetWindowUserPointer(window));
+    if (app != nullptr)
+    {
+        app->framebufferResized = true;
     }
 }
 
@@ -256,29 +344,13 @@ void SplatCoreApp::cleanup()
         pipelineLayout = VK_NULL_HANDLE;
     }
 
-    for (VkFramebuffer framebuffer : swapChainFramebuffers)
-    {
-        vkDestroyFramebuffer(device, framebuffer, nullptr);
-    }
-    swapChainFramebuffers.clear();
-
     if (renderPass != VK_NULL_HANDLE)
     {
         vkDestroyRenderPass(device, renderPass, nullptr);
         renderPass = VK_NULL_HANDLE;
     }
 
-    for (VkImageView imageView : swapChainImageViews)
-    {
-        vkDestroyImageView(device, imageView, nullptr);
-    }
-    swapChainImageViews.clear();
-
-    if (swapChain != VK_NULL_HANDLE)
-    {
-        vkDestroySwapchainKHR(device, swapChain, nullptr);
-        swapChain = VK_NULL_HANDLE;
-    }
+    cleanupSwapChain();   // destroys framebuffers, imageViews, swapchain
 
     if (device != VK_NULL_HANDLE)
     {
@@ -321,17 +393,15 @@ void SplatCoreApp::drawFrame()
 {
     failIfValidationIssueDetected();
 
-    // 1) CPU throttle by frame slot.
-    if (vkWaitForFences(device, 1, &inFlightFences[currentFrame], VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+    // 1) CPU throttle: wait for this frame slot to be free.
+    //    Do NOT reset the fence yet — acquire might fail.
+    if (vkWaitForFences(device, 1, &inFlightFences[currentFrame],
+                        VK_TRUE, UINT64_MAX) != VK_SUCCESS)
     {
         throw std::runtime_error("vkWaitForFences failed.");
     }
-    if (vkResetFences(device, 1, &inFlightFences[currentFrame]) != VK_SUCCESS)
-    {
-        throw std::runtime_error("vkResetFences failed.");
-    }
 
-    // 2) Acquire with per-frame semaphore slot.
+    // 2) Acquire swapchain image.
     uint32_t imageIndex = 0;
     const VkResult acquireResult = vkAcquireNextImageKHR(
         device,
@@ -343,34 +413,38 @@ void SplatCoreApp::drawFrame()
 
     if (acquireResult == VK_ERROR_OUT_OF_DATE_KHR)
     {
+        // Fence was NOT reset — safe to recreate and return.
+        recreateSwapChain();
         glfwPollEvents();
         return;
     }
-    if (acquireResult == VK_SUBOPTIMAL_KHR)
-    {
-        glfwPollEvents();
-        return;
-    }
-    if (acquireResult != VK_SUCCESS)
+    if (acquireResult != VK_SUCCESS && acquireResult != VK_SUBOPTIMAL_KHR)
     {
         throw std::runtime_error("vkAcquireNextImageKHR failed.");
     }
 
-    // 3) Per-image fence tracking: ensure this image is physically free.
+    // 3) Acquire succeeded — NOW safe to reset the fence.
+    if (vkResetFences(device, 1, &inFlightFences[currentFrame]) != VK_SUCCESS)
+    {
+        throw std::runtime_error("vkResetFences failed.");
+    }
+
+    // 4) Per-image fence tracking.
     {
         const uint32_t prevFrame = imagesInFlight[imageIndex];
-        // Guard: skip if this image was last used by the SAME frame slot
-        // (fence was already reset above) or if it was never used.
         if (prevFrame != kNoFrame && prevFrame != currentFrame)
         {
-            if (vkWaitForFences(device, 1, &inFlightFences[prevFrame], VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+            if (vkWaitForFences(device, 1, &inFlightFences[prevFrame],
+                                VK_TRUE, UINT64_MAX) != VK_SUCCESS)
             {
-                throw std::runtime_error("vkWaitForFences failed for imagesInFlight[imageIndex].");
+                throw std::runtime_error(
+                    "vkWaitForFences failed for imagesInFlight[imageIndex].");
             }
         }
         imagesInFlight[imageIndex] = currentFrame;
     }
 
+    // 5) Record command buffer.
     VkCommandBuffer currentCommandBuffer = commandBuffers[currentFrame];
     if (vkResetCommandBuffer(currentCommandBuffer, 0) != VK_SUCCESS)
     {
@@ -378,47 +452,66 @@ void SplatCoreApp::drawFrame()
     }
     recordCommandBuffer(currentCommandBuffer, imageIndex);
 
-    // imageAvailable is indexed by currentFrame
-    const VkSemaphore waitSemaphores[] = {imageAvailableSemaphores[currentFrame]};
+    // 6) Submit.
+    const VkSemaphore waitSemaphores[]   = {imageAvailableSemaphores[currentFrame]};
     const VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
     const VkSemaphore signalSemaphores[] = {renderFinishedSemaphores[imageIndex]};
 
     VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.waitSemaphoreCount = 1;
-    submitInfo.pWaitSemaphores = waitSemaphores;
-    submitInfo.pWaitDstStageMask = waitStages;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &currentCommandBuffer;
+    submitInfo.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.waitSemaphoreCount   = 1;
+    submitInfo.pWaitSemaphores      = waitSemaphores;
+    submitInfo.pWaitDstStageMask    = waitStages;
+    submitInfo.commandBufferCount   = 1;
+    submitInfo.pCommandBuffers      = &currentCommandBuffer;
     submitInfo.signalSemaphoreCount = 1;
-    submitInfo.pSignalSemaphores = signalSemaphores;
+    submitInfo.pSignalSemaphores    = signalSemaphores;
 
-    if (vkQueueSubmit(graphicsQueue, 1, &submitInfo, inFlightFences[currentFrame]) != VK_SUCCESS)
+    if (vkQueueSubmit(graphicsQueue, 1, &submitInfo,
+                      inFlightFences[currentFrame]) != VK_SUCCESS)
     {
         throw std::runtime_error("vkQueueSubmit failed.");
     }
 
+    // 7) Present.
     const VkSwapchainKHR swapChains[] = {swapChain};
     VkPresentInfoKHR presentInfo{};
-    presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    presentInfo.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     presentInfo.waitSemaphoreCount = 1;
-    presentInfo.pWaitSemaphores = signalSemaphores;
-    presentInfo.swapchainCount = 1;
-    presentInfo.pSwapchains = swapChains;
-    presentInfo.pImageIndices = &imageIndex;
+    presentInfo.pWaitSemaphores    = signalSemaphores;
+    presentInfo.swapchainCount     = 1;
+    presentInfo.pSwapchains        = swapChains;
+    presentInfo.pImageIndices      = &imageIndex;
 
     const VkResult presentResult = vkQueuePresentKHR(presentQueue, &presentInfo);
-    if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR)
+    if (presentResult == VK_ERROR_OUT_OF_DATE_KHR ||
+        presentResult == VK_SUBOPTIMAL_KHR         ||
+        framebufferResized)
     {
-        glfwPollEvents();
-        return;
+        framebufferResized = false;
+        recreateSwapChain();
     }
-    if (presentResult != VK_SUCCESS)
+    else if (presentResult != VK_SUCCESS)
     {
         throw std::runtime_error("vkQueuePresentKHR failed.");
     }
 
     currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
+
+    // 8) FPS counter — update title every second.
+    frameCount++;
+    const double now = glfwGetTime();
+    if (now - lastFpsTime >= 1.0)
+    {
+        const double fps = static_cast<double>(frameCount) / (now - lastFpsTime);
+        const std::string title =
+            std::string(kWindowTitle) +
+            "  |  FPS: " + std::to_string(static_cast<int>(fps));
+        glfwSetWindowTitle(window, title.c_str());
+        frameCount  = 0;
+        lastFpsTime = now;
+    }
+
     glfwPollEvents();
     failIfValidationIssueDetected();
 }
@@ -458,7 +551,19 @@ void SplatCoreApp::createInstance()
     VkDebugUtilsMessengerCreateInfoEXT debugCreateInfo{};
     populateDebugMessengerCreateInfo(debugCreateInfo);
     debugCreateInfo.pUserData = this;
-    createInfo.pNext = &debugCreateInfo;
+
+    // Enable BestPractices validation feature.
+    // Chain: createInfo.pNext -> validationFeatures -> debugCreateInfo -> nullptr
+    const VkValidationFeatureEnableEXT bestPracticesEnable =
+        VK_VALIDATION_FEATURE_ENABLE_BEST_PRACTICES_EXT;
+    VkValidationFeaturesEXT validationFeatures{};
+    validationFeatures.sType =
+        VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
+    validationFeatures.enabledValidationFeatureCount = 1;
+    validationFeatures.pEnabledValidationFeatures   = &bestPracticesEnable;
+    validationFeatures.pNext                         = &debugCreateInfo;
+
+    createInfo.pNext = &validationFeatures;
 #endif
 
     if (vkCreateInstance(&createInfo, nullptr, &instance) != VK_SUCCESS)
@@ -556,6 +661,7 @@ void SplatCoreApp::createLogicalDevice()
     }
 
     VkPhysicalDeviceFeatures deviceFeatures{};
+    vkGetPhysicalDeviceFeatures(physicalDevice, &deviceFeatures);
 
     VkDeviceCreateInfo createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -834,7 +940,22 @@ void SplatCoreApp::recordCommandBuffer(VkCommandBuffer cmdBuffer, uint32_t image
     vkCmdBeginRenderPass(cmdBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 
     vkCmdBindPipeline(cmdBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
-    vkCmdDraw(cmdBuffer, 3, 1, 0, 0);   // 3 hardcoded vertices, 1 instance
+
+    VkViewport viewport{};
+    viewport.x        = 0.0f;
+    viewport.y        = 0.0f;
+    viewport.width    = static_cast<float>(swapChainExtent.width);
+    viewport.height   = static_cast<float>(swapChainExtent.height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(cmdBuffer, 0, 1, &viewport);
+
+    VkRect2D scissor{};
+    scissor.offset = {0, 0};
+    scissor.extent = swapChainExtent;
+    vkCmdSetScissor(cmdBuffer, 0, 1, &scissor);
+
+    vkCmdDraw(cmdBuffer, 3, 1, 0, 0);
 
     vkCmdEndRenderPass(cmdBuffer);
 
@@ -911,25 +1032,13 @@ void SplatCoreApp::createGraphicsPipeline()
     inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     inputAssembly.primitiveRestartEnable = VK_FALSE;
 
-    // Fixed viewport and scissor — window is non-resizable (GLFW_RESIZABLE=FALSE).
-    VkViewport viewport{};
-    viewport.x        = 0.0f;
-    viewport.y        = 0.0f;
-    viewport.width    = static_cast<float>(swapChainExtent.width);
-    viewport.height   = static_cast<float>(swapChainExtent.height);
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
-
-    VkRect2D scissor{};
-    scissor.offset = {0, 0};
-    scissor.extent = swapChainExtent;
-
+    // Dynamic viewport and scissor — set per-frame in recordCommandBuffer().
     VkPipelineViewportStateCreateInfo viewportState{};
     viewportState.sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
     viewportState.viewportCount = 1;
-    viewportState.pViewports    = &viewport;
+    viewportState.pViewports    = nullptr;  // set dynamically
     viewportState.scissorCount  = 1;
-    viewportState.pScissors     = &scissor;
+    viewportState.pScissors     = nullptr;  // set dynamically
 
     VkPipelineRasterizationStateCreateInfo rasterizer{};
     rasterizer.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
@@ -983,7 +1092,16 @@ void SplatCoreApp::createGraphicsPipeline()
     pipelineInfo.pMultisampleState   = &multisampling;
     pipelineInfo.pDepthStencilState  = nullptr;
     pipelineInfo.pColorBlendState    = &colorBlending;
-    pipelineInfo.pDynamicState       = nullptr;
+    const VkDynamicState dynamicStates[] = {
+        VK_DYNAMIC_STATE_VIEWPORT,
+        VK_DYNAMIC_STATE_SCISSOR
+    };
+    VkPipelineDynamicStateCreateInfo dynamicStateInfo{};
+    dynamicStateInfo.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamicStateInfo.dynamicStateCount = 2;
+    dynamicStateInfo.pDynamicStates    = dynamicStates;
+
+    pipelineInfo.pDynamicState = &dynamicStateInfo;
     pipelineInfo.layout              = pipelineLayout;
     pipelineInfo.renderPass          = renderPass;
     pipelineInfo.subpass             = 0;
@@ -1232,6 +1350,11 @@ VKAPI_ATTR VkBool32 VKAPI_CALL SplatCoreApp::debugCallback(
 
     if ((messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) != 0U)
     {
+        // Ignore duplicate implicit-layer noise emitted by some launcher overlays.
+        if (std::strstr(message, "Removing layer VK_LAYER_EOS_Overlay") != nullptr)
+        {
+            return VK_FALSE;
+        }
         std::cout << "[Validation][WARNING][Type:" << messageType << "] " << message << std::endl;
         return VK_FALSE;
     }
