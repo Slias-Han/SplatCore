@@ -22,6 +22,15 @@
 #include <string>
 #include <vector>
 
+#include "src/core/memory/MemorySystem.h"
+#include "src/core/memory/VramLogger.h"
+
+using SplatCore::Allocation;
+using SplatCore::AllocationDesc;
+using SplatCore::MemoryRegion;
+using SplatCore::MemorySystem;
+using SplatCore::VramLogger;
+
 // ── Vertex layout ────────────────────────────────────────────────────────
 struct Vertex
 {
@@ -183,7 +192,7 @@ private:
     std::vector<VkFence> inFlightFences;
     // Depth buffer (tied to swapchain extent)
     VkImage depthImage = VK_NULL_HANDLE;
-    VkDeviceMemory depthImageMemory = VK_NULL_HANDLE;
+    Allocation depthImageAllocation{};
     VkImageView depthImageView = VK_NULL_HANDLE;
 
     VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
@@ -192,11 +201,11 @@ private:
 
     // Point cloud geometry buffer
     VkBuffer pointVertexBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory pointVertexBufferMemory = VK_NULL_HANDLE;
+    Allocation pointVertexBufferAllocation{};
     uint32_t pointCount = 0;
 
     std::vector<VkBuffer> uniformBuffers;
-    std::vector<VkDeviceMemory> uniformBuffersMemory;
+    std::vector<Allocation> uniformBufferAllocations;
     std::vector<void *> uniformBuffersMapped;
 
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
@@ -209,6 +218,8 @@ private:
     bool framebufferResized = false;
     double lastFpsTime = 0.0;
     uint32_t frameCount = 0;
+    uint32_t frameIndex = 1;
+    uint32_t maxFrameCount = 0;
     double lastFrameTime = 0.0;
 
     // FPS camera and mouse state
@@ -250,14 +261,18 @@ private:
     void createUniformBuffers();
     void createDescriptorPool();
     void createDescriptorSets();
-    void updateUniformBuffer(uint32_t frameIndex);
+    void updateUniformBuffer(uint32_t frameSlot);
     uint32_t findMemoryType(uint32_t typeFilter,
                             VkMemoryPropertyFlags properties) const;
     void createBuffer(VkDeviceSize size,
                       VkBufferUsageFlags usage,
                       VkMemoryPropertyFlags properties,
                       VkBuffer &buffer,
-                      VkDeviceMemory &bufferMemory);
+                      Allocation &allocation,
+                      MemoryRegion region,
+                      std::string_view allocationName);
+    void destroyBufferAllocation(VkBuffer &buffer,
+                                 Allocation &allocation);
     void copyBuffer(VkBuffer srcBuffer,
                     VkBuffer dstBuffer,
                     VkDeviceSize size);
@@ -267,7 +282,12 @@ private:
                      VkFormat format, VkImageTiling tiling,
                      VkImageUsageFlags usage,
                      VkMemoryPropertyFlags properties,
-                     VkImage &image, VkDeviceMemory &imageMemory);
+                     VkImage &image,
+                     Allocation &allocation,
+                     MemoryRegion region,
+                     std::string_view allocationName);
+    void destroyImageAllocation(VkImage &image,
+                                Allocation &allocation);
     VkImageView createImageView(VkImage image, VkFormat format,
                                 VkImageAspectFlags aspectFlags);
     VkFormat findSupportedFormat(const std::vector<VkFormat> &candidates,
@@ -319,6 +339,19 @@ SplatCoreApp::~SplatCoreApp()
 
 void SplatCoreApp::run()
 {
+    char* envValue = nullptr;
+    size_t envValueLength = 0;
+    if (_dupenv_s(&envValue, &envValueLength, "SPLATCORE_MAX_FRAMES") == 0 &&
+        envValue != nullptr)
+    {
+        const unsigned long parsedValue = std::strtoul(envValue, nullptr, 10);
+        if (parsedValue > 0)
+        {
+            maxFrameCount = static_cast<uint32_t>(parsedValue);
+        }
+    }
+    std::free(envValue);
+
     initWindow();
     initVulkan();
     mainLoop();
@@ -360,6 +393,8 @@ void SplatCoreApp::initVulkan()
     createSurface();
     pickPhysicalDevice();
     createLogicalDevice();
+    MemorySystem::init(instance, physicalDevice, device);
+    VramLogger::init("engine.log");
     createSwapChain();
     createImageViews();
     createDepthResources(); // depth image sized to swapchain extent
@@ -398,16 +433,7 @@ void SplatCoreApp::cleanupSwapChain()
         vkDestroyImageView(device, depthImageView, nullptr);
         depthImageView = VK_NULL_HANDLE;
     }
-    if (depthImage != VK_NULL_HANDLE)
-    {
-        vkDestroyImage(device, depthImage, nullptr);
-        depthImage = VK_NULL_HANDLE;
-    }
-    if (depthImageMemory != VK_NULL_HANDLE)
-    {
-        vkFreeMemory(device, depthImageMemory, nullptr);
-        depthImageMemory = VK_NULL_HANDLE;
-    }
+    destroyImageAllocation(depthImage, depthImageAllocation);
 
     for (VkFramebuffer framebuffer : swapChainFramebuffers)
     {
@@ -540,33 +566,29 @@ void SplatCoreApp::cleanup()
         descriptorSetLayout = VK_NULL_HANDLE;
     }
 
-    // Uniform buffers (persistently mapped — unmap by destroying)
+    // Uniform buffers (persistently mapped — explicit unmap before free)
     for (size_t i = 0; i < uniformBuffers.size(); ++i)
     {
-        if (uniformBuffers[i] != VK_NULL_HANDLE)
+        if (uniformBuffersMapped[i] != nullptr &&
+            uniformBufferAllocations[i].vmaAllocation != nullptr)
         {
-            vkDestroyBuffer(device, uniformBuffers[i], nullptr);
+            vmaUnmapMemory(MemorySystem::allocator(),
+                           uniformBufferAllocations[i].vmaAllocation);
+            uniformBuffersMapped[i] = nullptr;
         }
-        if (uniformBuffersMemory[i] != VK_NULL_HANDLE)
-        {
-            vkFreeMemory(device, uniformBuffersMemory[i], nullptr);
-        }
+        destroyBufferAllocation(uniformBuffers[i], uniformBufferAllocations[i]);
     }
     uniformBuffers.clear();
-    uniformBuffersMemory.clear();
+    uniformBufferAllocations.clear();
     uniformBuffersMapped.clear();
 
     // Point cloud geometry buffer
-    if (pointVertexBuffer != VK_NULL_HANDLE)
-    {
-        vkDestroyBuffer(device, pointVertexBuffer, nullptr);
-        pointVertexBuffer = VK_NULL_HANDLE;
-    }
-    if (pointVertexBufferMemory != VK_NULL_HANDLE)
-    {
-        vkFreeMemory(device, pointVertexBufferMemory, nullptr);
-        pointVertexBufferMemory = VK_NULL_HANDLE;
-    }
+    destroyBufferAllocation(pointVertexBuffer, pointVertexBufferAllocation);
+
+    cleanupSwapChain(); // destroys framebuffers, imageViews, swapchain
+
+    VramLogger::shutdown();
+    MemorySystem::shutdown();
 
     if (graphicsPipeline != VK_NULL_HANDLE)
     {
@@ -583,8 +605,6 @@ void SplatCoreApp::cleanup()
         vkDestroyRenderPass(device, renderPass, nullptr);
         renderPass = VK_NULL_HANDLE;
     }
-
-    cleanupSwapChain(); // destroys framebuffers, imageViews, swapchain
 
     if (device != VK_NULL_HANDLE)
     {
@@ -758,6 +778,18 @@ void SplatCoreApp::drawFrame()
     else if (presentResult != VK_SUCCESS)
     {
         throw std::runtime_error("vkQueuePresentKHR failed.");
+    }
+
+    // Present has completed for this frame. Before the next frame starts,
+    // force-release DYNAMIC allocations, then snapshot and log VRAM usage.
+    MemorySystem::flushDynamicAllocations();
+    const auto snap = MemorySystem::snapshot(frameIndex);
+    VramLogger::logFrame(snap);
+    ++frameIndex;
+
+    if (maxFrameCount != 0 && frameIndex > maxFrameCount)
+    {
+        glfwSetWindowShouldClose(window, GLFW_TRUE);
     }
 
     currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
@@ -1473,39 +1505,47 @@ uint32_t SplatCoreApp::findMemoryType(uint32_t typeFilter,
     throw std::runtime_error("Failed to find suitable memory type.");
 }
 
+void SplatCoreApp::destroyBufferAllocation(VkBuffer &buffer,
+                                           Allocation &allocation)
+{
+    if (allocation.vmaAllocation != nullptr)
+    {
+        MemorySystem::free(allocation);
+    }
+    buffer = VK_NULL_HANDLE;
+}
+
 // ── Generic buffer creator ───────────────────────────────────────────────
 void SplatCoreApp::createBuffer(VkDeviceSize size,
                                 VkBufferUsageFlags usage,
                                 VkMemoryPropertyFlags properties,
                                 VkBuffer &buffer,
-                                VkDeviceMemory &bufferMemory)
+                                Allocation &allocation,
+                                MemoryRegion region,
+                                std::string_view allocationName)
 {
-    VkBufferCreateInfo bufferInfo{};
-    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufferInfo.size = size;
-    bufferInfo.usage = usage;
-    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    buffer = VK_NULL_HANDLE;
+    allocation = {};
 
-    if (vkCreateBuffer(device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS)
+    AllocationDesc desc{};
+    desc.region = region;
+    desc.bufferUsage = usage;
+    if ((properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0)
     {
-        throw std::runtime_error("Failed to create buffer.");
+        desc.vmaUsage = (usage & VK_BUFFER_USAGE_TRANSFER_SRC_BIT) != 0
+                            ? VMA_MEMORY_USAGE_CPU_ONLY
+                            : VMA_MEMORY_USAGE_CPU_TO_GPU;
     }
-
-    VkMemoryRequirements memRequirements{};
-    vkGetBufferMemoryRequirements(device, buffer, &memRequirements);
-
-    VkMemoryAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.allocationSize = memRequirements.size;
-    allocInfo.memoryTypeIndex = findMemoryType(
-        memRequirements.memoryTypeBits, properties);
-
-    if (vkAllocateMemory(device, &allocInfo, nullptr, &bufferMemory) != VK_SUCCESS)
+    else
     {
-        throw std::runtime_error("Failed to allocate buffer memory.");
+        desc.vmaUsage = VMA_MEMORY_USAGE_GPU_ONLY;
     }
+    desc.size = size;
+    desc.allocationName = allocationName;
+    desc.imageInfo = nullptr;
 
-    vkBindBufferMemory(device, buffer, bufferMemory, 0);
+    allocation = MemorySystem::allocate(desc);
+    buffer = allocation.buffer;
 }
 
 // ── Single-time command helpers ──────────────────────────────────────────
@@ -1518,27 +1558,46 @@ VkCommandBuffer SplatCoreApp::beginSingleTimeCommands()
     allocInfo.commandBufferCount = 1;
 
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
-    vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer);
+    if (vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer) != VK_SUCCESS)
+    {
+        throw std::runtime_error("Failed to allocate single-time command buffer.");
+    }
 
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(commandBuffer, &beginInfo);
+    if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS)
+    {
+        vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
+        throw std::runtime_error("Failed to begin single-time command buffer.");
+    }
 
     return commandBuffer;
 }
 
 void SplatCoreApp::endSingleTimeCommands(VkCommandBuffer commandBuffer)
 {
-    vkEndCommandBuffer(commandBuffer);
+    if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS)
+    {
+        vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
+        throw std::runtime_error("Failed to end single-time command buffer.");
+    }
 
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &commandBuffer;
 
-    vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(graphicsQueue);
+    if (vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE) != VK_SUCCESS)
+    {
+        vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
+        throw std::runtime_error("Failed to submit single-time command buffer.");
+    }
+    if (vkQueueWaitIdle(graphicsQueue) != VK_SUCCESS)
+    {
+        vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
+        throw std::runtime_error("Failed waiting for single-time command buffer.");
+    }
 
     vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
 }
@@ -1558,12 +1617,28 @@ void SplatCoreApp::copyBuffer(VkBuffer srcBuffer,
 }
 
 // ── Image creation helper ─────────────────────────────────────────────────
+void SplatCoreApp::destroyImageAllocation(VkImage &image,
+                                          Allocation &allocation)
+{
+    if (allocation.vmaAllocation != nullptr)
+    {
+        MemorySystem::free(allocation);
+    }
+    image = VK_NULL_HANDLE;
+}
+
 void SplatCoreApp::createImage(uint32_t width, uint32_t height,
                                VkFormat format, VkImageTiling tiling,
                                VkImageUsageFlags usage,
                                VkMemoryPropertyFlags properties,
-                               VkImage &image, VkDeviceMemory &imageMemory)
+                               VkImage &image,
+                               Allocation &allocation,
+                               MemoryRegion region,
+                               std::string_view allocationName)
 {
+    image = VK_NULL_HANDLE;
+    allocation = {};
+
     VkImageCreateInfo imageInfo{};
     imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     imageInfo.imageType = VK_IMAGE_TYPE_2D;
@@ -1579,21 +1654,22 @@ void SplatCoreApp::createImage(uint32_t width, uint32_t height,
     imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
     imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-    if (vkCreateImage(device, &imageInfo, nullptr, &image) != VK_SUCCESS)
-        throw std::runtime_error("Failed to create image.");
+    AllocationDesc desc{};
+    desc.region = region;
+    desc.bufferUsage = 0;
+    desc.vmaUsage = (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0
+                        ? VMA_MEMORY_USAGE_AUTO_PREFER_HOST
+                        : VMA_MEMORY_USAGE_GPU_ONLY;
+    desc.size = 0;
+    desc.allocationName = allocationName;
+    desc.imageInfo = &imageInfo;
 
-    VkMemoryRequirements memReq{};
-    vkGetImageMemoryRequirements(device, image, &memReq);
-
-    VkMemoryAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.allocationSize = memReq.size;
-    allocInfo.memoryTypeIndex = findMemoryType(memReq.memoryTypeBits, properties);
-
-    if (vkAllocateMemory(device, &allocInfo, nullptr, &imageMemory) != VK_SUCCESS)
-        throw std::runtime_error("Failed to allocate image memory.");
-
-    vkBindImageMemory(device, image, imageMemory, 0);
+    allocation = MemorySystem::allocate(desc);
+    image = allocation.image;
+    if (image == VK_NULL_HANDLE)
+    {
+        throw std::runtime_error("MemorySystem::allocate returned null VkImage.");
+    }
 }
 
 VkImageView SplatCoreApp::createImageView(VkImage image, VkFormat format,
@@ -1655,9 +1731,20 @@ void SplatCoreApp::createDepthResources()
                 VK_IMAGE_TILING_OPTIMAL,
                 VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                depthImage, depthImageMemory);
-    depthImageView = createImageView(depthImage, depthFormat,
-                                     VK_IMAGE_ASPECT_DEPTH_BIT);
+                depthImage,
+                depthImageAllocation,
+                MemoryRegion::STATIC,
+                "GaussianRenderer::DepthImage");
+    try
+    {
+        depthImageView = createImageView(depthImage, depthFormat,
+                                         VK_IMAGE_ASPECT_DEPTH_BIT);
+    }
+    catch (...)
+    {
+        destroyImageAllocation(depthImage, depthImageAllocation);
+        throw;
+    }
 }
 
 // ── Binary PLY loader ─────────────────────────────────────────────────────
@@ -1667,6 +1754,10 @@ void SplatCoreApp::loadPointCloud()
         throw std::runtime_error("PLY file path not set.");
 
     std::cout << "[PLY] Loading: " << plyFilePath << std::endl;
+
+    // Reload-safe: release previous point cloud ownership before reallocation.
+    destroyBufferAllocation(pointVertexBuffer, pointVertexBufferAllocation);
+    pointCount = 0;
 
     std::ifstream file(plyFilePath, std::ios::binary);
     if (!file.is_open())
@@ -1804,26 +1895,47 @@ void SplatCoreApp::loadPointCloud()
     const VkDeviceSize bufferSize = sizeof(Vertex) * vertices.size();
 
     VkBuffer stagingBuf = VK_NULL_HANDLE;
-    VkDeviceMemory stagingMem = VK_NULL_HANDLE;
-    createBuffer(bufferSize,
-                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                 stagingBuf, stagingMem);
+    Allocation stagingAllocation{};
+    try
+    {
+        createBuffer(bufferSize,
+                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     stagingBuf,
+                     stagingAllocation,
+                     MemoryRegion::STAGING,
+                     "TextureUploader::PointCloudStagingBuffer");
 
-    void *data = nullptr;
-    vkMapMemory(device, stagingMem, 0, bufferSize, 0, &data);
-    std::memcpy(data, vertices.data(), static_cast<size_t>(bufferSize));
-    vkUnmapMemory(device, stagingMem);
+        void *data = nullptr;
+        if (vmaMapMemory(MemorySystem::allocator(),
+                         stagingAllocation.vmaAllocation,
+                         &data) != VK_SUCCESS)
+        {
+            throw std::runtime_error("Failed to map staging buffer memory.");
+        }
+        std::memcpy(data, vertices.data(), static_cast<size_t>(bufferSize));
+        vmaUnmapMemory(MemorySystem::allocator(),
+                       stagingAllocation.vmaAllocation);
 
-    createBuffer(bufferSize,
-                 VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                 pointVertexBuffer, pointVertexBufferMemory);
+        createBuffer(bufferSize,
+                     VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                     pointVertexBuffer,
+                     pointVertexBufferAllocation,
+                     MemoryRegion::STATIC,
+                     "GaussianRenderer::SplatVertexBuffer");
 
-    copyBuffer(stagingBuf, pointVertexBuffer, bufferSize);
+        copyBuffer(stagingBuf, pointVertexBuffer, bufferSize);
+    }
+    catch (...)
+    {
+        destroyBufferAllocation(stagingBuf, stagingAllocation);
+        destroyBufferAllocation(pointVertexBuffer, pointVertexBufferAllocation);
+        pointCount = 0;
+        throw;
+    }
 
-    vkDestroyBuffer(device, stagingBuf, nullptr);
-    vkFreeMemory(device, stagingMem, nullptr);
+    destroyBufferAllocation(stagingBuf, stagingAllocation);
 
     std::cout << "[PLY] GPU upload complete — " << pointCount << " points, "
               << (bufferSize >> 20) << " MB VRAM." << std::endl;
@@ -1893,7 +2005,7 @@ void SplatCoreApp::createUniformBuffers()
     const VkDeviceSize bufferSize = sizeof(UniformBufferObject);
 
     uniformBuffers.resize(MAX_FRAMES_IN_FLIGHT, VK_NULL_HANDLE);
-    uniformBuffersMemory.resize(MAX_FRAMES_IN_FLIGHT, VK_NULL_HANDLE);
+    uniformBufferAllocations.resize(MAX_FRAMES_IN_FLIGHT, {});
     uniformBuffersMapped.resize(MAX_FRAMES_IN_FLIGHT, nullptr);
 
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
@@ -1902,11 +2014,19 @@ void SplatCoreApp::createUniformBuffers()
                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                     uniformBuffers[i], uniformBuffersMemory[i]);
+                     uniformBuffers[i],
+                     uniformBufferAllocations[i],
+                     MemoryRegion::STATIC,
+                     "GaussianRenderer::PerFrameUniformBuffer");
 
         // Persistent map — never unmap until destroy.
-        vkMapMemory(device, uniformBuffersMemory[i], 0, bufferSize,
-                    0, &uniformBuffersMapped[i]);
+        if (vmaMapMemory(MemorySystem::allocator(),
+                         uniformBufferAllocations[i].vmaAllocation,
+                         &uniformBuffersMapped[i]) != VK_SUCCESS)
+        {
+            destroyBufferAllocation(uniformBuffers[i], uniformBufferAllocations[i]);
+            throw std::runtime_error("Failed to map uniform buffer memory.");
+        }
     }
 }
 
@@ -1970,7 +2090,7 @@ void SplatCoreApp::createDescriptorSets()
 }
 
 // ── MVP matrix update (called once per frame) ────────────────────────────
-void SplatCoreApp::updateUniformBuffer(uint32_t frameIndex)
+void SplatCoreApp::updateUniformBuffer(uint32_t frameSlot)
 {
     UniformBufferObject ubo{};
 
@@ -1990,7 +2110,7 @@ void SplatCoreApp::updateUniformBuffer(uint32_t frameIndex)
     // Vulkan Y-flip.
     ubo.proj[1][1] *= -1.0f;
 
-    std::memcpy(uniformBuffersMapped[frameIndex], &ubo, sizeof(ubo));
+    std::memcpy(uniformBuffersMapped[frameSlot], &ubo, sizeof(ubo));
 }
 
 bool SplatCoreApp::checkValidationLayerSupport() const

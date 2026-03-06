@@ -4,6 +4,9 @@ A high-performance, hardware-accelerated 3D Gaussian Splatting engine engineered
 ## Changelog
 
 ## v0.5 - Binary PLY loader, point cloud rendering, FPS camera, depth buffer
+- Memory lifecycle constitution added: see `docs/V05_MEMORY_LIFECYCLE_CONSTITUTION.md`
+- Creation failure rollback added for Vulkan buffer/image paths
+- Explicit uniform-buffer unmap and unified buffer/image teardown helpers
 
 ## v0.4 - Vertex buffer, index buffer, MVP matrix, rotating 3D cube
 

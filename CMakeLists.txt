@@ -1,4 +1,11 @@
 cmake_minimum_required(VERSION 3.22)
+
+# 强制 x64 架构（Ninja 生成器不自动继承，必须显式声明）
+set(CMAKE_VS_PLATFORM_NAME "x64")
+if(NOT DEFINED CMAKE_GENERATOR_PLATFORM)
+    set(CMAKE_GENERATOR_PLATFORM "x64" CACHE STRING "" FORCE)
+endif()
+
 project(SplatCore_SilasHan)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -49,7 +56,23 @@ endforeach()
 add_custom_target(SplatCore_Shaders ALL DEPENDS ${SPV_OUTPUTS})
 # ─────────────────────────────────────────────────────────────────────────
 
-add_executable(SplatCore_SilasHan main.cpp)
+add_executable(SplatCore_SilasHan
+    main.cpp
+    src/core/memory/MemorySystem.cpp
+    src/core/memory/VramLogger.cpp
+    third_party/vma/vma_impl.cpp
+)
+
+if(MSVC)
+    set_source_files_properties(third_party/vma/vma_impl.cpp PROPERTIES
+        COMPILE_OPTIONS "/wd4100;/wd4189;/wd4324")
+else()
+    set_source_files_properties(third_party/vma/vma_impl.cpp PROPERTIES COMPILE_OPTIONS "-w")
+endif()
+
+target_include_directories(SplatCore_SilasHan PRIVATE
+    third_party/vma
+)
 
 target_link_libraries(SplatCore_SilasHan PRIVATE
     Vulkan::Vulkan
@@ -86,3 +109,52 @@ else()
         $<$<CONFIG:Release>:-O2 -DNDEBUG>
     )
 endif()
+
+enable_testing()
+
+add_executable(SplatCore_MemoryLifecycleTests
+    tests/memory/test_vram_lifecycle.cpp
+    src/core/memory/MemorySystem.cpp
+    third_party/vma/vma_impl.cpp
+)
+
+target_include_directories(SplatCore_MemoryLifecycleTests PRIVATE
+    third_party/vma
+    .
+)
+
+target_link_libraries(SplatCore_MemoryLifecycleTests PRIVATE
+    Vulkan::Vulkan
+    ${Vulkan_LIBRARIES}
+    $<$<CONFIG:Debug>:ucrtd.lib>
+    $<$<CONFIG:Debug>:vcruntimed.lib>
+    $<$<CONFIG:Debug>:msvcrtd.lib>
+    $<$<CONFIG:Release>:ucrt.lib>
+    $<$<CONFIG:Release>:vcruntime.lib>
+    $<$<CONFIG:Release>:msvcrt.lib>
+    kernel32.lib user32.lib
+)
+
+if(MSVC)
+    set(WINSDK_LIB "$ENV{WindowsSdkDir}Lib/$ENV{WindowsSDKVersion}um/x64")
+    target_link_directories(SplatCore_MemoryLifecycleTests PRIVATE
+        "${WINSDK_LIB}"
+    )
+endif()
+
+if(MSVC)
+    target_compile_options(SplatCore_MemoryLifecycleTests PRIVATE
+        /W4
+        $<$<CONFIG:Debug>:/Od /Zi /RTC1>
+        $<$<CONFIG:Release>:/O2 /DNDEBUG>
+    )
+else()
+    target_compile_options(SplatCore_MemoryLifecycleTests PRIVATE
+        -Wall -Wextra -Wpedantic
+        $<$<CONFIG:Debug>:-O0 -g>
+        $<$<CONFIG:Release>:-O2 -DNDEBUG>
+    )
+endif()
+
+add_test(NAME memory_vram_lifecycle
+         COMMAND SplatCore_MemoryLifecycleTests)
