@@ -1,0 +1,64 @@
+name: VRAM Poison Test (M1 Gate)
+
+on:
+  push:
+    branches: [ main, 'v0.*' ]
+  pull_request:
+    branches: [ main ]
+
+# 失败则 block merge（通过 required status check 配置）
+# 此 workflow 本身无需额外配置，PR 保护规则在 GitHub 仓库设置中开启
+
+jobs:
+  vram-poison-test:
+    name: VRAM Poison Test — llvmpipe
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install Vulkan SDK + Mesa llvmpipe
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends \
+          libvulkan-dev \
+          vulkan-validationlayers \
+          mesa-vulkan-drivers \
+          libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+          libglfw3-dev \
+          cmake ninja-build \
+          glslc
+
+    - name: Force llvmpipe (no GPU required)
+      run: |
+        echo "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json" >> $GITHUB_ENV
+        echo "VK_LOADER_DRIVERS_SELECT=lvp" >> $GITHUB_ENV
+
+    - name: Configure CMake
+      run: |
+        cmake -B build -S . \
+          -DCMAKE_BUILD_TYPE=Release \
+          -G Ninja
+
+    - name: Build Shaders
+      run: cmake --build build --target Shaders
+
+    - name: Build Poison Test
+      run: cmake --build build --target SplatCore_PoisonTests
+
+    - name: Run VRAM Poison Test
+      run: |
+        cd build
+        ./SplatCore_PoisonTests \
+          ../tests/assets/poison_test_scene.ply \
+          shaders
+      timeout-minutes: 10
+
+    - name: Upload Diff Reports on Failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: poison-diff-reports
+        path: build/diff_*.txt
+        retention-days: 7

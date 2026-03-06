@@ -39,7 +39,7 @@ set(SHADER_SOURCES
     "${SHADER_SRC_DIR}/point.frag"
 )
 
-set(SPV_OUTPUTS "")
+set(SHADER_OUTPUTS "")
 foreach(SHADER IN LISTS SHADER_SOURCES)
     get_filename_component(SHADER_NAME "${SHADER}" NAME)
     set(SPV_OUT "${SHADER_BIN_DIR}/${SHADER_NAME}.spv")
@@ -50,16 +50,28 @@ foreach(SHADER IN LISTS SHADER_SOURCES)
         COMMENT "glslc: ${SHADER_NAME} -> ${SHADER_NAME}.spv"
         VERBATIM
     )
-    list(APPEND SPV_OUTPUTS "${SPV_OUT}")
+    list(APPEND SHADER_OUTPUTS "${SPV_OUT}")
 endforeach()
 
-add_custom_target(SplatCore_Shaders ALL DEPENDS ${SPV_OUTPUTS})
+add_custom_command(
+    OUTPUT "${CMAKE_BINARY_DIR}/shaders/vram_poison_comp.spv"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shaders"
+    COMMAND "${GLSLC_EXECUTABLE}"
+        "${CMAKE_SOURCE_DIR}/shaders/vram_poison.comp"
+        -o "${CMAKE_BINARY_DIR}/shaders/vram_poison_comp.spv"
+    DEPENDS "${CMAKE_SOURCE_DIR}/shaders/vram_poison.comp"
+    VERBATIM
+)
+list(APPEND SHADER_OUTPUTS "${CMAKE_BINARY_DIR}/shaders/vram_poison_comp.spv")
+
+add_custom_target(SplatCore_Shaders ALL DEPENDS ${SHADER_OUTPUTS})
 # ─────────────────────────────────────────────────────────────────────────
 
 add_executable(SplatCore_SilasHan
     main.cpp
     src/core/memory/MemorySystem.cpp
     src/core/memory/VramLogger.cpp
+    src/tests/PoisonTestHarness.cpp
     third_party/vma/vma_impl.cpp
 )
 
@@ -158,3 +170,60 @@ endif()
 
 add_test(NAME memory_vram_lifecycle
          COMMAND SplatCore_MemoryLifecycleTests)
+
+add_executable(SplatCore_PoisonTests
+    tests/poison/test_vram_poison.cpp
+    src/tests/PoisonTestHarness.cpp
+    src/core/memory/MemorySystem.cpp
+    src/core/memory/VramLogger.cpp
+    third_party/vma/vma_impl.cpp
+)
+
+target_include_directories(SplatCore_PoisonTests PRIVATE
+    ${Vulkan_INCLUDE_DIRS}
+    third_party/vma
+    src
+    .
+)
+
+target_link_libraries(SplatCore_PoisonTests PRIVATE
+    Vulkan::Vulkan
+    ${Vulkan_LIBRARIES}
+    glfw
+    glm::glm
+    $<$<CONFIG:Debug>:ucrtd.lib>
+    $<$<CONFIG:Debug>:vcruntimed.lib>
+    $<$<CONFIG:Debug>:msvcrtd.lib>
+    $<$<CONFIG:Release>:ucrt.lib>
+    $<$<CONFIG:Release>:vcruntime.lib>
+    $<$<CONFIG:Release>:msvcrt.lib>
+    kernel32.lib user32.lib
+)
+
+target_compile_definitions(SplatCore_PoisonTests PRIVATE
+    "SHADER_DIR=\"${SHADER_BIN_DIR}/\""
+    $<$<CONFIG:Debug>:VK_ENABLE_VALIDATION_LAYERS>
+)
+
+if(MSVC)
+    target_compile_options(SplatCore_PoisonTests PRIVATE
+        /W4
+        $<$<CONFIG:Debug>:/Od /Zi /RTC1>
+        $<$<CONFIG:Release>:/O2 /DNDEBUG>
+    )
+else()
+    target_compile_options(SplatCore_PoisonTests PRIVATE
+        -Wall -Wextra -Wpedantic
+        $<$<CONFIG:Debug>:-O0 -g>
+        $<$<CONFIG:Release>:-O2 -DNDEBUG>
+    )
+endif()
+
+add_dependencies(SplatCore_PoisonTests SplatCore_Shaders)
+
+add_test(NAME vram_poison_test
+    COMMAND SplatCore_PoisonTests
+            "${CMAKE_SOURCE_DIR}/tests/assets/poison_test_scene.ply"
+            "${CMAKE_BINARY_DIR}/shaders"
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+)

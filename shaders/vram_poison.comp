@@ -1,0 +1,21 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer PoisonBuffer {
+    uint32_t data[];
+} poisonBuf;
+
+layout(push_constant) uniform PushConstants {
+    uint32_t poisonPattern;  // 0x7FC00000=NaN, 0x7F800000=+Inf,
+                             // 0xFF800000=-Inf, 0xDEADBEEF=dead
+    uint32_t elementCount;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx < pc.elementCount) {
+        poisonBuf.data[idx] = pc.poisonPattern;
+    }
+}

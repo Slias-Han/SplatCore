@@ -132,6 +132,22 @@ public:
     ~SplatCoreApp();
     void run();
     void setPlyPath(const std::string &path) { plyFilePath = path; }
+    void initializeWindowForTesting();
+    void initializeVulkanCoreForTesting();
+    void initializeRenderResourcesForTesting();
+    void renderFramesForTesting(uint32_t frameCount);
+    void readbackOffscreenForTesting(std::vector<uint32_t> &outPixels);
+    void shutdownForTesting();
+    VkDevice deviceForTesting() const { return device; }
+    VkPhysicalDevice physicalDeviceForTesting() const { return physicalDevice; }
+    VkCommandPool commandPoolForTesting() const { return commandPool; }
+    VkQueue computeQueueForTesting() const { return graphicsQueue; }
+    VkBuffer offscreenReadbackBufferForTesting() const { return offscreenReadbackBuffer; }
+    VkDeviceSize offscreenReadbackBufferSizeForTesting() const
+    {
+        return offscreenReadbackAllocation.size;
+    }
+    VkPhysicalDeviceProperties physicalDevicePropertiesForTesting() const;
 
 private:
     static constexpr uint32_t kWidth = 800;
@@ -194,6 +210,14 @@ private:
     VkImage depthImage = VK_NULL_HANDLE;
     Allocation depthImageAllocation{};
     VkImageView depthImageView = VK_NULL_HANDLE;
+    // Offscreen Render Target（v0.6 毒化测试用）
+    VkImage offscreenImage = VK_NULL_HANDLE;
+    VkDeviceMemory offscreenMemory = VK_NULL_HANDLE; // 保留备用
+    VkImageView offscreenImageView = VK_NULL_HANDLE;
+    VkFramebuffer offscreenFramebuffer = VK_NULL_HANDLE;
+    SplatCore::Allocation offscreenAllocation{};
+    VkBuffer offscreenReadbackBuffer = VK_NULL_HANDLE;
+    SplatCore::Allocation offscreenReadbackAllocation{};
 
     VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
@@ -237,6 +261,8 @@ private:
 
     void initWindow();
     void initVulkan();
+    void initVulkanCore();
+    void initRenderResources();
     void mainLoop();
     void cleanup();
     void drawFrame();
@@ -252,6 +278,9 @@ private:
     void createCommandPool();
     void createCommandBuffer();
     void createSyncObjects();
+    void createOffscreenTarget();
+    void destroyOffscreenTarget();
+    void readbackOffscreenFrame(std::vector<uint32_t> &outPixels);
     void cleanupSwapChain();
     void recreateSwapChain();
     void createDepthResources();
@@ -357,6 +386,52 @@ void SplatCoreApp::run()
     mainLoop();
 }
 
+void SplatCoreApp::initializeWindowForTesting()
+{
+    initWindow();
+}
+
+void SplatCoreApp::initializeVulkanCoreForTesting()
+{
+    initVulkanCore();
+}
+
+void SplatCoreApp::initializeRenderResourcesForTesting()
+{
+    initRenderResources();
+}
+
+void SplatCoreApp::renderFramesForTesting(uint32_t targetFrameCount)
+{
+    maxFrameCount = targetFrameCount;
+    mainLoop();
+}
+
+void SplatCoreApp::readbackOffscreenForTesting(std::vector<uint32_t> &outPixels)
+{
+    if (device != VK_NULL_HANDLE && vkDeviceWaitIdle(device) != VK_SUCCESS)
+    {
+        throw std::runtime_error("vkDeviceWaitIdle failed before offscreen readback.");
+    }
+    readbackOffscreenFrame(outPixels);
+    failIfValidationIssueDetected();
+}
+
+void SplatCoreApp::shutdownForTesting()
+{
+    cleanup();
+}
+
+VkPhysicalDeviceProperties SplatCoreApp::physicalDevicePropertiesForTesting() const
+{
+    VkPhysicalDeviceProperties props{};
+    if (physicalDevice != VK_NULL_HANDLE)
+    {
+        vkGetPhysicalDeviceProperties(physicalDevice, &props);
+    }
+    return props;
+}
+
 void SplatCoreApp::initWindow()
 {
     if (glfwInit() == GLFW_FALSE)
@@ -386,6 +461,12 @@ void SplatCoreApp::initWindow()
 
 void SplatCoreApp::initVulkan()
 {
+    initVulkanCore();
+    initRenderResources();
+}
+
+void SplatCoreApp::initVulkanCore()
+{
     createInstance();
 #ifdef VK_ENABLE_VALIDATION_LAYERS
     setupDebugMessenger();
@@ -395,6 +476,11 @@ void SplatCoreApp::initVulkan()
     createLogicalDevice();
     MemorySystem::init(instance, physicalDevice, device);
     VramLogger::init("engine.log");
+    createCommandPool();
+}
+
+void SplatCoreApp::initRenderResources()
+{
     createSwapChain();
     createImageViews();
     createDepthResources(); // depth image sized to swapchain extent
@@ -402,13 +488,13 @@ void SplatCoreApp::initVulkan()
     createDescriptorSetLayout(); // must exist before pipeline
     createGraphicsPipeline();
     createFramebuffers();
-    createCommandPool();
     loadPointCloud(); // parse PLY + staging upload to GPU
     createUniformBuffers();
     createDescriptorPool();
     createDescriptorSets();
     createCommandBuffer();
     createSyncObjects();
+    createOffscreenTarget();
     failIfValidationIssueDetected();
 }
 
@@ -427,6 +513,8 @@ void SplatCoreApp::mainLoop()
 
 void SplatCoreApp::cleanupSwapChain()
 {
+    destroyOffscreenTarget();
+
     // Depth buffer is tied to swapchain extent — destroy before framebuffers.
     if (depthImageView != VK_NULL_HANDLE)
     {
@@ -474,6 +562,7 @@ void SplatCoreApp::recreateSwapChain()
     createImageViews();
     createDepthResources(); // must come before createFramebuffers
     createFramebuffers();
+    createOffscreenTarget();
 
     // renderFinishedSemaphores are sized by swapchain image count,
     // which may have changed — destroy old ones and recreate.
@@ -585,6 +674,7 @@ void SplatCoreApp::cleanup()
     // Point cloud geometry buffer
     destroyBufferAllocation(pointVertexBuffer, pointVertexBufferAllocation);
 
+    destroyOffscreenTarget();
     cleanupSwapChain(); // destroys framebuffers, imageViews, swapchain
 
     VramLogger::shutdown();
@@ -1005,7 +1095,9 @@ void SplatCoreApp::createSwapChain()
     createInfo.imageColorSpace = surfaceFormat.colorSpace;
     createInfo.imageExtent = extent;
     createInfo.imageArrayLayers = 1;
-    createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    createInfo.imageUsage =
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+        VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 
     if (indices.graphicsFamily != indices.presentFamily)
     {
@@ -1232,6 +1324,235 @@ void SplatCoreApp::createSyncObjects()
     }
 }
 
+void SplatCoreApp::destroyOffscreenTarget()
+{
+    if (offscreenFramebuffer != VK_NULL_HANDLE)
+    {
+        vkDestroyFramebuffer(device, offscreenFramebuffer, nullptr);
+        offscreenFramebuffer = VK_NULL_HANDLE;
+    }
+    if (offscreenImageView != VK_NULL_HANDLE)
+    {
+        vkDestroyImageView(device, offscreenImageView, nullptr);
+        offscreenImageView = VK_NULL_HANDLE;
+    }
+    MemorySystem::free(offscreenAllocation);
+    MemorySystem::free(offscreenReadbackAllocation);
+    offscreenImage = VK_NULL_HANDLE;
+    offscreenMemory = VK_NULL_HANDLE;
+    offscreenReadbackBuffer = VK_NULL_HANDLE;
+}
+
+void SplatCoreApp::createOffscreenTarget()
+{
+    destroyOffscreenTarget();
+
+    createImage(swapChainExtent.width,
+                swapChainExtent.height,
+                swapChainImageFormat,
+                VK_IMAGE_TILING_OPTIMAL,
+                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                    VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                offscreenImage,
+                offscreenAllocation,
+                MemoryRegion::STATIC,
+                "PoisonTest::OffscreenColorTarget");
+
+    try
+    {
+        offscreenImageView = createImageView(offscreenImage,
+                                             swapChainImageFormat,
+                                             VK_IMAGE_ASPECT_COLOR_BIT);
+
+        const std::array<VkImageView, 2> attachments = {
+            offscreenImageView, depthImageView};
+
+        VkFramebufferCreateInfo framebufferInfo{};
+        framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        framebufferInfo.renderPass = renderPass;
+        framebufferInfo.attachmentCount =
+            static_cast<uint32_t>(attachments.size());
+        framebufferInfo.pAttachments = attachments.data();
+        framebufferInfo.width = swapChainExtent.width;
+        framebufferInfo.height = swapChainExtent.height;
+        framebufferInfo.layers = 1;
+
+        if (vkCreateFramebuffer(device, &framebufferInfo, nullptr,
+                                &offscreenFramebuffer) != VK_SUCCESS)
+        {
+            throw std::runtime_error(
+                "Failed to create offscreen framebuffer.");
+        }
+
+        AllocationDesc readbackDesc{};
+        readbackDesc.region = MemoryRegion::STATIC;
+        readbackDesc.bufferUsage =
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        readbackDesc.vmaUsage = VMA_MEMORY_USAGE_CPU_ONLY;
+        readbackDesc.size =
+            static_cast<VkDeviceSize>(swapChainExtent.width) *
+            static_cast<VkDeviceSize>(swapChainExtent.height) *
+            sizeof(uint32_t);
+        readbackDesc.allocationName = "PoisonTest::ReadbackBuffer";
+        readbackDesc.imageInfo = nullptr;
+
+        offscreenReadbackAllocation = MemorySystem::allocate(readbackDesc);
+        offscreenReadbackBuffer = offscreenReadbackAllocation.buffer;
+
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+        VkImageMemoryBarrier toTransferDst{};
+        toTransferDst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        toTransferDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        toTransferDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toTransferDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toTransferDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toTransferDst.image = offscreenImage;
+        toTransferDst.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        toTransferDst.subresourceRange.baseMipLevel = 0;
+        toTransferDst.subresourceRange.levelCount = 1;
+        toTransferDst.subresourceRange.baseArrayLayer = 0;
+        toTransferDst.subresourceRange.layerCount = 1;
+        toTransferDst.srcAccessMask = 0;
+        toTransferDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+        vkCmdPipelineBarrier(commandBuffer,
+                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0,
+                             0, nullptr,
+                             0, nullptr,
+                             1, &toTransferDst);
+
+        endSingleTimeCommands(commandBuffer);
+    }
+    catch (...)
+    {
+        destroyOffscreenTarget();
+        throw;
+    }
+}
+
+void SplatCoreApp::readbackOffscreenFrame(std::vector<uint32_t> &outPixels)
+{
+    if (offscreenImage == VK_NULL_HANDLE ||
+        offscreenReadbackBuffer == VK_NULL_HANDLE)
+    {
+        throw std::runtime_error("Offscreen target is not initialized.");
+    }
+
+    const size_t pixelCount =
+        static_cast<size_t>(swapChainExtent.width) *
+        static_cast<size_t>(swapChainExtent.height);
+    const VkDeviceSize byteSize =
+        static_cast<VkDeviceSize>(pixelCount) * sizeof(uint32_t);
+
+    outPixels.resize(pixelCount);
+
+    VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+    VkImageMemoryBarrier toTransferSrc{};
+    toTransferSrc.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    toTransferSrc.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toTransferSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toTransferSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransferSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransferSrc.image = offscreenImage;
+    toTransferSrc.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    toTransferSrc.subresourceRange.baseMipLevel = 0;
+    toTransferSrc.subresourceRange.levelCount = 1;
+    toTransferSrc.subresourceRange.baseArrayLayer = 0;
+    toTransferSrc.subresourceRange.layerCount = 1;
+    toTransferSrc.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toTransferSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+    vkCmdPipelineBarrier(commandBuffer,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0,
+                         0, nullptr,
+                         0, nullptr,
+                         1, &toTransferSrc);
+
+    VkBufferImageCopy copyRegion{};
+    copyRegion.bufferOffset = 0;
+    copyRegion.bufferRowLength = 0;
+    copyRegion.bufferImageHeight = 0;
+    copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copyRegion.imageSubresource.mipLevel = 0;
+    copyRegion.imageSubresource.baseArrayLayer = 0;
+    copyRegion.imageSubresource.layerCount = 1;
+    copyRegion.imageExtent = {
+        swapChainExtent.width,
+        swapChainExtent.height,
+        1};
+
+    vkCmdCopyImageToBuffer(commandBuffer,
+                           offscreenImage,
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           offscreenReadbackBuffer,
+                           1,
+                           &copyRegion);
+
+    VkBufferMemoryBarrier bufferToHost{};
+    bufferToHost.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    bufferToHost.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    bufferToHost.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    bufferToHost.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bufferToHost.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bufferToHost.buffer = offscreenReadbackBuffer;
+    bufferToHost.offset = 0;
+    bufferToHost.size = byteSize;
+
+    vkCmdPipelineBarrier(commandBuffer,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT,
+                         0,
+                         0, nullptr,
+                         1, &bufferToHost,
+                         0, nullptr);
+
+    VkImageMemoryBarrier backToColorAttachment{};
+    backToColorAttachment.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    backToColorAttachment.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    backToColorAttachment.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    backToColorAttachment.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    backToColorAttachment.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    backToColorAttachment.image = offscreenImage;
+    backToColorAttachment.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    backToColorAttachment.subresourceRange.baseMipLevel = 0;
+    backToColorAttachment.subresourceRange.levelCount = 1;
+    backToColorAttachment.subresourceRange.baseArrayLayer = 0;
+    backToColorAttachment.subresourceRange.layerCount = 1;
+    backToColorAttachment.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    backToColorAttachment.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+    vkCmdPipelineBarrier(commandBuffer,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0,
+                         0, nullptr,
+                         0, nullptr,
+                         1, &backToColorAttachment);
+
+    endSingleTimeCommands(commandBuffer);
+
+    void *mappedData = nullptr;
+    if (vmaMapMemory(MemorySystem::allocator(),
+                     offscreenReadbackAllocation.vmaAllocation,
+                     &mappedData) != VK_SUCCESS)
+    {
+        throw std::runtime_error("Failed to map offscreen readback buffer.");
+    }
+
+    std::memcpy(outPixels.data(), mappedData, static_cast<size_t>(byteSize));
+    vmaUnmapMemory(MemorySystem::allocator(),
+                   offscreenReadbackAllocation.vmaAllocation);
+}
+
 void SplatCoreApp::recordCommandBuffer(VkCommandBuffer cmdBuffer, uint32_t imageIndex)
 {
     VkCommandBufferBeginInfo beginInfo{};
@@ -1289,6 +1610,74 @@ void SplatCoreApp::recordCommandBuffer(VkCommandBuffer cmdBuffer, uint32_t image
     vkCmdDraw(cmdBuffer, pointCount, 1, 0, 0);
 
     vkCmdEndRenderPass(cmdBuffer);
+
+    VkImageMemoryBarrier swapchainToTransferSrc{};
+    swapchainToTransferSrc.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    swapchainToTransferSrc.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    swapchainToTransferSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    swapchainToTransferSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    swapchainToTransferSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    swapchainToTransferSrc.image = swapChainImages[imageIndex];
+    swapchainToTransferSrc.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    swapchainToTransferSrc.subresourceRange.baseMipLevel = 0;
+    swapchainToTransferSrc.subresourceRange.levelCount = 1;
+    swapchainToTransferSrc.subresourceRange.baseArrayLayer = 0;
+    swapchainToTransferSrc.subresourceRange.layerCount = 1;
+    swapchainToTransferSrc.srcAccessMask = 0;
+    swapchainToTransferSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+    vkCmdPipelineBarrier(cmdBuffer,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0,
+                         0, nullptr,
+                         0, nullptr,
+                         1, &swapchainToTransferSrc);
+
+    VkImageCopy copyRegion{};
+    copyRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copyRegion.srcSubresource.mipLevel = 0;
+    copyRegion.srcSubresource.baseArrayLayer = 0;
+    copyRegion.srcSubresource.layerCount = 1;
+    copyRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copyRegion.dstSubresource.mipLevel = 0;
+    copyRegion.dstSubresource.baseArrayLayer = 0;
+    copyRegion.dstSubresource.layerCount = 1;
+    copyRegion.extent = {
+        swapChainExtent.width,
+        swapChainExtent.height,
+        1};
+
+    vkCmdCopyImage(cmdBuffer,
+                   swapChainImages[imageIndex],
+                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   offscreenImage,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                   1,
+                   &copyRegion);
+
+    VkImageMemoryBarrier swapchainBackToPresent{};
+    swapchainBackToPresent.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    swapchainBackToPresent.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    swapchainBackToPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    swapchainBackToPresent.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    swapchainBackToPresent.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    swapchainBackToPresent.image = swapChainImages[imageIndex];
+    swapchainBackToPresent.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    swapchainBackToPresent.subresourceRange.baseMipLevel = 0;
+    swapchainBackToPresent.subresourceRange.levelCount = 1;
+    swapchainBackToPresent.subresourceRange.baseArrayLayer = 0;
+    swapchainBackToPresent.subresourceRange.layerCount = 1;
+    swapchainBackToPresent.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    swapchainBackToPresent.dstAccessMask = 0;
+
+    vkCmdPipelineBarrier(cmdBuffer,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                         0,
+                         0, nullptr,
+                         0, nullptr,
+                         1, &swapchainBackToPresent);
 
     if (vkEndCommandBuffer(cmdBuffer) != VK_SUCCESS)
     {
@@ -2255,6 +2644,11 @@ VkSurfaceFormatKHR SplatCoreApp::chooseSwapSurfaceFormat(const std::vector<VkSur
         {
             return availableFormat;
         }
+        if (availableFormat.format == VK_FORMAT_B8G8R8A8_UNORM &&
+            availableFormat.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+        {
+            return availableFormat;
+        }
     }
 
     return availableFormats[0];
@@ -2391,6 +2785,7 @@ void SplatCoreApp::destroyDebugUtilsMessengerEXT(
     }
 }
 
+#ifndef SPLATCORE_NO_ENTRYPOINT
 int main(int argc, char *argv[])
 {
     if (argc < 2)
@@ -2414,3 +2809,4 @@ int main(int argc, char *argv[])
 
     return EXIT_SUCCESS;
 }
+#endif
