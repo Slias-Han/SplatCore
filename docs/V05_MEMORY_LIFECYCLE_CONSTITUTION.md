@@ -47,3 +47,12 @@ A PR that introduces any new allocation is blocked unless it includes:
 - `destroyImageAndMemory(VkImage&, VkDeviceMemory&)`
 
 These helpers are mandatory for paired resource teardown to avoid split ownership.
+
+## 7. VMA Binding Path Note
+Buffer/Image use the `vkCreate* + vmaAllocateMemory + vmaBind*Memory` path instead of
+`vmaCreateBuffer` / `vmaCreateImage`.
+
+Reason: the convenience APIs can hang under the current Debug Validation Layer combination.
+This is treated as a known driver-compatibility issue, not an ownership-model exception.
+
+Memory ownership remains 100% under VMA, so the constitution core constraints are unchanged.
