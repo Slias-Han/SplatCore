@@ -64,6 +64,17 @@ add_custom_command(
 )
 list(APPEND SHADER_OUTPUTS "${CMAKE_BINARY_DIR}/shaders/vram_poison_comp.spv")
 
+add_custom_command(
+    OUTPUT "${CMAKE_BINARY_DIR}/shaders/sha256_compute.spv"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shaders"
+    COMMAND "${GLSLC_EXECUTABLE}"
+        "${CMAKE_SOURCE_DIR}/shaders/sha256_compute.comp"
+        -o "${CMAKE_BINARY_DIR}/shaders/sha256_compute.spv"
+    DEPENDS "${CMAKE_SOURCE_DIR}/shaders/sha256_compute.comp"
+    VERBATIM
+)
+list(APPEND SHADER_OUTPUTS "${CMAKE_BINARY_DIR}/shaders/sha256_compute.spv")
+
 add_custom_target(SplatCore_Shaders ALL DEPENDS ${SHADER_OUTPUTS})
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -71,6 +82,7 @@ add_executable(SplatCore_SilasHan
     main.cpp
     src/core/memory/MemorySystem.cpp
     src/core/memory/VramLogger.cpp
+    src/tests/HashProbe.cpp
     src/tests/PoisonTestHarness.cpp
     third_party/vma/vma_impl.cpp
 )
@@ -173,6 +185,7 @@ add_test(NAME memory_vram_lifecycle
 
 add_executable(SplatCore_PoisonTests
     tests/poison/test_vram_poison.cpp
+    src/tests/HashProbe.cpp
     src/tests/PoisonTestHarness.cpp
     src/core/memory/MemorySystem.cpp
     src/core/memory/VramLogger.cpp
@@ -223,6 +236,64 @@ add_dependencies(SplatCore_PoisonTests SplatCore_Shaders)
 
 add_test(NAME vram_poison_test
     COMMAND SplatCore_PoisonTests
+            "${CMAKE_SOURCE_DIR}/tests/assets/poison_test_scene.ply"
+            "${CMAKE_BINARY_DIR}/shaders"
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+)
+
+add_executable(SplatCore_SHA256Tests
+    tests/sha256/test_sha256_consistency.cpp
+    src/tests/HashProbe.cpp
+    src/tests/PoisonTestHarness.cpp
+    src/core/memory/MemorySystem.cpp
+    src/core/memory/VramLogger.cpp
+    third_party/vma/vma_impl.cpp
+)
+
+target_include_directories(SplatCore_SHA256Tests PRIVATE
+    ${Vulkan_INCLUDE_DIRS}
+    third_party/vma
+    src
+    .
+)
+
+target_link_libraries(SplatCore_SHA256Tests PRIVATE
+    Vulkan::Vulkan
+    ${Vulkan_LIBRARIES}
+    glfw
+    glm::glm
+    $<$<CONFIG:Debug>:ucrtd.lib>
+    $<$<CONFIG:Debug>:vcruntimed.lib>
+    $<$<CONFIG:Debug>:msvcrtd.lib>
+    $<$<CONFIG:Release>:ucrt.lib>
+    $<$<CONFIG:Release>:vcruntime.lib>
+    $<$<CONFIG:Release>:msvcrt.lib>
+    kernel32.lib user32.lib
+)
+
+target_compile_definitions(SplatCore_SHA256Tests PRIVATE
+    "SHADER_DIR=\"${SHADER_BIN_DIR}/\""
+    $<$<CONFIG:Debug>:VK_ENABLE_VALIDATION_LAYERS>
+)
+
+if(MSVC)
+    target_compile_options(SplatCore_SHA256Tests PRIVATE
+        /W4
+        $<$<CONFIG:Debug>:/Od /Zi /RTC1>
+        $<$<CONFIG:Release>:/O2 /DNDEBUG>
+    )
+else()
+    target_compile_options(SplatCore_SHA256Tests PRIVATE
+        -Wall -Wextra -Wpedantic
+        $<$<CONFIG:Debug>:-O0 -g>
+        $<$<CONFIG:Release>:-O2 -DNDEBUG>
+    )
+endif()
+
+add_dependencies(SplatCore_SHA256Tests SplatCore_Shaders)
+
+add_test(NAME sha256_consistency_test
+    COMMAND SplatCore_SHA256Tests
             "${CMAKE_SOURCE_DIR}/tests/assets/poison_test_scene.ply"
             "${CMAKE_BINARY_DIR}/shaders"
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"

@@ -42,7 +42,7 @@ jobs:
           -G Ninja
 
     - name: Build Shaders
-      run: cmake --build build --target Shaders
+      run: cmake --build build --target SplatCore_Shaders
 
     - name: Build Poison Test
       run: cmake --build build --target SplatCore_PoisonTests
@@ -62,3 +62,24 @@ jobs:
         name: poison-diff-reports
         path: build/diff_*.txt
         retention-days: 7
+
+    - name: Build SHA256 Test
+      run: cmake --build build --target SplatCore_SHA256Tests
+
+    - name: Run SHA256 Consistency Test
+      run: |
+        cd build
+        ./SplatCore_SHA256Tests \
+          ../tests/assets/poison_test_scene.ply \
+          shaders
+      timeout-minutes: 10
+
+    - name: Upload SHA256 Reports
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: sha256-reports
+        path: |
+          build/sha256_log.txt
+          build/sha256_rootcause.md
+        retention-days: 14

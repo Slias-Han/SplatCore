@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <fstream>
 #include <cstdlib>
 #include <cstring>
@@ -24,6 +25,7 @@
 
 #include "src/core/memory/MemorySystem.h"
 #include "src/core/memory/VramLogger.h"
+#include "src/tests/HashProbe.h"
 
 using SplatCore::Allocation;
 using SplatCore::AllocationDesc;
@@ -138,6 +140,11 @@ public:
     void renderFramesForTesting(uint32_t frameCount);
     void readbackOffscreenForTesting(std::vector<uint32_t> &outPixels);
     void shutdownForTesting();
+    void enableHashProbeForTesting(const std::string &spvPath);
+    const std::vector<SplatCore::FrameHash> &frameHashesForTesting() const
+    {
+        return frameHashes;
+    }
     VkDevice deviceForTesting() const { return device; }
     VkPhysicalDevice physicalDeviceForTesting() const { return physicalDevice; }
     VkCommandPool commandPoolForTesting() const { return commandPool; }
@@ -245,6 +252,11 @@ private:
     uint32_t frameIndex = 1;
     uint32_t maxFrameCount = 0;
     double lastFrameTime = 0.0;
+    bool hashProbeRequested = false;
+    std::string hashProbeSpvPath;
+    SplatCore::HashProbe hashProbe;
+    std::vector<SplatCore::FrameHash> frameHashes;
+    bool hashProbeEnabled = false;
 
     // FPS camera and mouse state
     Camera camera{};
@@ -422,6 +434,12 @@ void SplatCoreApp::shutdownForTesting()
     cleanup();
 }
 
+void SplatCoreApp::enableHashProbeForTesting(const std::string &spvPath)
+{
+    hashProbeRequested = true;
+    hashProbeSpvPath = spvPath;
+}
+
 VkPhysicalDeviceProperties SplatCoreApp::physicalDevicePropertiesForTesting() const
 {
     VkPhysicalDeviceProperties props{};
@@ -496,6 +514,37 @@ void SplatCoreApp::initRenderResources()
     createSyncObjects();
     createOffscreenTarget();
     failIfValidationIssueDetected();
+
+    const char* hashProbeEnv = nullptr;
+#pragma warning(push)
+#pragma warning(disable: 4996)
+    hashProbeEnv = std::getenv("SPLATCORE_HASH_PROBE");
+#pragma warning(pop)
+    const bool enableHashProbeFromEnv =
+        hashProbeEnv != nullptr && std::string(hashProbeEnv) == "1";
+    if (enableHashProbeFromEnv || hashProbeRequested)
+    {
+        if (hashProbe.isReady())
+        {
+            hashProbe.shutdown();
+        }
+
+        const std::string hashProbeShaderPath =
+            hashProbeSpvPath.empty()
+                ? std::string(SHADER_DIR) + "sha256_compute.spv"
+                : hashProbeSpvPath;
+        hashProbe.init(device,
+                       physicalDevice,
+                       commandPool,
+                       graphicsQueue,
+                       offscreenImageView,
+                       swapChainExtent.width,
+                       swapChainExtent.height,
+                       hashProbeShaderPath.c_str());
+        hashProbeEnabled = true;
+        frameHashes.clear();
+        frameHashes.reserve(100);
+    }
 }
 
 void SplatCoreApp::mainLoop()
@@ -564,6 +613,26 @@ void SplatCoreApp::recreateSwapChain()
     createFramebuffers();
     createOffscreenTarget();
 
+    if (hashProbeEnabled && hashProbe.isReady())
+    {
+        hashProbe.shutdown();
+
+        const std::string hashProbeShaderPath =
+            hashProbeSpvPath.empty()
+                ? std::string(SHADER_DIR) + "sha256_compute.spv"
+                : hashProbeSpvPath;
+        hashProbe.init(device,
+                       physicalDevice,
+                       commandPool,
+                       graphicsQueue,
+                       offscreenImageView,
+                       swapChainExtent.width,
+                       swapChainExtent.height,
+                       hashProbeShaderPath.c_str());
+        frameHashes.clear();
+        frameHashes.reserve(100);
+    }
+
     // renderFinishedSemaphores are sized by swapchain image count,
     // which may have changed — destroy old ones and recreate.
     for (VkSemaphore semaphore : renderFinishedSemaphores)
@@ -611,6 +680,11 @@ void SplatCoreApp::cleanup()
     if (device != VK_NULL_HANDLE)
     {
         vkDeviceWaitIdle(device);
+    }
+
+    if (hashProbe.isReady())
+    {
+        hashProbe.shutdown();
     }
 
     for (VkSemaphore semaphore : imageAvailableSemaphores)
@@ -845,6 +919,23 @@ void SplatCoreApp::drawFrame()
                       inFlightFences[currentFrame]) != VK_SUCCESS)
     {
         throw std::runtime_error("vkQueueSubmit failed.");
+    }
+
+    if (hashProbeEnabled && hashProbe.isReady())
+    {
+        const auto hash = hashProbe.computeHash(offscreenImage, frameIndex);
+        frameHashes.push_back(hash);
+
+        if (frameHashes.size() >= 100)
+        {
+            const float rate =
+                hashProbe.analyzeConsistency(frameHashes, "sha256_log.txt");
+            hashProbe.generateRootCauseReport(frameHashes, "sha256_rootcause.md");
+            std::fprintf(stdout,
+                         "[HashProbe] 100帧采集完成，一致率: %.1f%%\n",
+                         rate * 100.0f);
+            hashProbeEnabled = false;
+        }
     }
 
     // 7) Present.
@@ -1347,11 +1438,13 @@ void SplatCoreApp::createOffscreenTarget()
 {
     destroyOffscreenTarget();
 
+    constexpr VkFormat offscreenHashFormat = VK_FORMAT_R8G8B8A8_UINT;
+
     createImage(swapChainExtent.width,
                 swapChainExtent.height,
-                swapChainImageFormat,
+                offscreenHashFormat,
                 VK_IMAGE_TILING_OPTIMAL,
-                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                VK_IMAGE_USAGE_STORAGE_BIT |
                     VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
@@ -1363,28 +1456,8 @@ void SplatCoreApp::createOffscreenTarget()
     try
     {
         offscreenImageView = createImageView(offscreenImage,
-                                             swapChainImageFormat,
+                                             offscreenHashFormat,
                                              VK_IMAGE_ASPECT_COLOR_BIT);
-
-        const std::array<VkImageView, 2> attachments = {
-            offscreenImageView, depthImageView};
-
-        VkFramebufferCreateInfo framebufferInfo{};
-        framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-        framebufferInfo.renderPass = renderPass;
-        framebufferInfo.attachmentCount =
-            static_cast<uint32_t>(attachments.size());
-        framebufferInfo.pAttachments = attachments.data();
-        framebufferInfo.width = swapChainExtent.width;
-        framebufferInfo.height = swapChainExtent.height;
-        framebufferInfo.layers = 1;
-
-        if (vkCreateFramebuffer(device, &framebufferInfo, nullptr,
-                                &offscreenFramebuffer) != VK_SUCCESS)
-        {
-            throw std::runtime_error(
-                "Failed to create offscreen framebuffer.");
-        }
 
         AllocationDesc readbackDesc{};
         readbackDesc.region = MemoryRegion::STATIC;
