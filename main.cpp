@@ -137,6 +137,7 @@ public:
     void initializeWindowForTesting();
     void initializeVulkanCoreForTesting();
     void initializeRenderResourcesForTesting();
+    void resetRenderResourcesForTesting();
     void renderFramesForTesting(uint32_t frameCount);
     void readbackOffscreenForTesting(std::vector<uint32_t> &outPixels);
     void shutdownForTesting();
@@ -275,6 +276,8 @@ private:
     void initVulkan();
     void initVulkanCore();
     void initRenderResources();
+    void destroyRenderResourcesPreserveDevice();
+    void resetFrameLoopStateForTesting();
     void mainLoop();
     void cleanup();
     void drawFrame();
@@ -425,9 +428,20 @@ void SplatCoreApp::initializeRenderResourcesForTesting()
     initRenderResources();
 }
 
+void SplatCoreApp::resetRenderResourcesForTesting()
+{
+    destroyRenderResourcesPreserveDevice();
+    resetFrameLoopStateForTesting();
+}
+
 void SplatCoreApp::renderFramesForTesting(uint32_t targetFrameCount)
 {
-    maxFrameCount = targetFrameCount;
+    if (window != nullptr)
+    {
+        glfwSetWindowShouldClose(window, GLFW_FALSE);
+    }
+    maxFrameCount = frameIndex + targetFrameCount - 1u;
+    lastFrameTime = glfwGetTime();
     mainLoop();
 }
 
@@ -700,96 +714,20 @@ void SplatCoreApp::cleanup()
         vkDeviceWaitIdle(device);
     }
 
-    if (hashProbe.isReady())
-    {
-        hashProbe.shutdown();
-    }
+    destroyRenderResourcesPreserveDevice();
 
-    for (VkSemaphore semaphore : imageAvailableSemaphores)
-    {
-        vkDestroySemaphore(device, semaphore, nullptr);
-    }
-    imageAvailableSemaphores.clear();
-
-    for (VkSemaphore semaphore : renderFinishedSemaphores)
-    {
-        vkDestroySemaphore(device, semaphore, nullptr);
-    }
-    renderFinishedSemaphores.clear();
-
-    for (VkFence fence : inFlightFences)
-    {
-        vkDestroyFence(device, fence, nullptr);
-    }
-    inFlightFences.clear();
-    imagesInFlight.clear();
-
-    if (commandPool != VK_NULL_HANDLE && !commandBuffers.empty())
-    {
-        vkFreeCommandBuffers(device, commandPool, static_cast<uint32_t>(commandBuffers.size()), commandBuffers.data());
-        commandBuffers.clear();
-    }
     if (commandPool != VK_NULL_HANDLE)
     {
         vkDestroyCommandPool(device, commandPool, nullptr);
         commandPool = VK_NULL_HANDLE;
     }
 
-    // Descriptor resources
-    if (descriptorPool != VK_NULL_HANDLE)
-    {
-        vkDestroyDescriptorPool(device, descriptorPool, nullptr);
-        descriptorPool = VK_NULL_HANDLE;
-    }
-    if (descriptorSetLayout != VK_NULL_HANDLE)
-    {
-        vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
-        descriptorSetLayout = VK_NULL_HANDLE;
-    }
-
-    // Uniform buffers (persistently mapped — explicit unmap before free)
-    for (size_t i = 0; i < uniformBuffers.size(); ++i)
-    {
-        if (uniformBuffersMapped[i] != nullptr &&
-            uniformBufferAllocations[i].vmaAllocation != nullptr)
-        {
-            vmaUnmapMemory(MemorySystem::allocator(),
-                           uniformBufferAllocations[i].vmaAllocation);
-            uniformBuffersMapped[i] = nullptr;
-        }
-        destroyBufferAllocation(uniformBuffers[i], uniformBufferAllocations[i]);
-    }
-    uniformBuffers.clear();
-    uniformBufferAllocations.clear();
-    uniformBuffersMapped.clear();
-
-    // Point cloud geometry buffer
-    destroyBufferAllocation(pointVertexBuffer, pointVertexBufferAllocation);
-
-    destroyOffscreenTarget();
-    cleanupSwapChain(); // destroys framebuffers, imageViews, swapchain
-
     VramLogger::shutdown();
     MemorySystem::shutdown();
 
-    if (graphicsPipeline != VK_NULL_HANDLE)
-    {
-        vkDestroyPipeline(device, graphicsPipeline, nullptr);
-        graphicsPipeline = VK_NULL_HANDLE;
-    }
-    if (pipelineLayout != VK_NULL_HANDLE)
-    {
-        vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
-        pipelineLayout = VK_NULL_HANDLE;
-    }
-    if (renderPass != VK_NULL_HANDLE)
-    {
-        vkDestroyRenderPass(device, renderPass, nullptr);
-        renderPass = VK_NULL_HANDLE;
-    }
-
     if (device != VK_NULL_HANDLE)
     {
+        std::fprintf(stdout, "VkDevice destroyed\n");
         vkDestroyDevice(device, nullptr);
         device = VK_NULL_HANDLE;
     }
@@ -822,6 +760,160 @@ void SplatCoreApp::cleanup()
     {
         glfwTerminate();
         glfwInitialized = false;
+    }
+}
+
+void SplatCoreApp::destroyRenderResourcesPreserveDevice()
+{
+    const bool memorySystemReady = MemorySystem::allocator() != nullptr;
+
+    if (hashProbe.isReady())
+    {
+        hashProbe.shutdown();
+    }
+
+    for (VkSemaphore semaphore : imageAvailableSemaphores)
+    {
+        vkDestroySemaphore(device, semaphore, nullptr);
+    }
+    imageAvailableSemaphores.clear();
+
+    for (VkSemaphore semaphore : renderFinishedSemaphores)
+    {
+        vkDestroySemaphore(device, semaphore, nullptr);
+    }
+    renderFinishedSemaphores.clear();
+
+    for (VkFence fence : inFlightFences)
+    {
+        vkDestroyFence(device, fence, nullptr);
+    }
+    inFlightFences.clear();
+    imagesInFlight.clear();
+
+    if (commandPool != VK_NULL_HANDLE && !commandBuffers.empty())
+    {
+        vkFreeCommandBuffers(device, commandPool, static_cast<uint32_t>(commandBuffers.size()), commandBuffers.data());
+        commandBuffers.clear();
+    }
+
+    // Descriptor resources
+    if (descriptorPool != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorPool(device, descriptorPool, nullptr);
+        descriptorPool = VK_NULL_HANDLE;
+    }
+    if (descriptorSetLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
+        descriptorSetLayout = VK_NULL_HANDLE;
+    }
+
+    // Uniform buffers (persistently mapped — explicit unmap before free)
+    for (size_t i = 0; i < uniformBuffers.size(); ++i)
+    {
+        if (memorySystemReady &&
+            uniformBuffersMapped[i] != nullptr &&
+            uniformBufferAllocations[i].vmaAllocation != nullptr)
+        {
+            vmaUnmapMemory(MemorySystem::allocator(),
+                           uniformBufferAllocations[i].vmaAllocation);
+            uniformBuffersMapped[i] = nullptr;
+        }
+        if (memorySystemReady)
+        {
+            destroyBufferAllocation(uniformBuffers[i], uniformBufferAllocations[i]);
+        }
+    }
+    uniformBuffers.clear();
+    uniformBufferAllocations.clear();
+    uniformBuffersMapped.clear();
+
+    if (offscreenImageView != VK_NULL_HANDLE)
+    {
+        vkDestroyImageView(device, offscreenImageView, nullptr);
+        offscreenImageView = VK_NULL_HANDLE;
+    }
+    offscreenFramebuffer = VK_NULL_HANDLE;
+
+    if (depthImageView != VK_NULL_HANDLE)
+    {
+        vkDestroyImageView(device, depthImageView, nullptr);
+        depthImageView = VK_NULL_HANDLE;
+    }
+
+    for (VkFramebuffer framebuffer : swapChainFramebuffers)
+    {
+        vkDestroyFramebuffer(device, framebuffer, nullptr);
+    }
+    swapChainFramebuffers.clear();
+
+    for (VkImageView imageView : swapChainImageViews)
+    {
+        vkDestroyImageView(device, imageView, nullptr);
+    }
+    swapChainImageViews.clear();
+
+    if (swapChain != VK_NULL_HANDLE)
+    {
+        vkDestroySwapchainKHR(device, swapChain, nullptr);
+        swapChain = VK_NULL_HANDLE;
+    }
+
+    if (memorySystemReady)
+    {
+        MemorySystem::flushDynamicAllocations();
+        MemorySystem::destroyStaticRegion();
+        MemorySystem::initStaticRegion();
+    }
+
+    pointVertexBuffer = VK_NULL_HANDLE;
+    pointVertexBufferAllocation = {};
+    pointCount = 0;
+
+    offscreenImage = VK_NULL_HANDLE;
+    offscreenMemory = VK_NULL_HANDLE;
+    offscreenAllocation = {};
+    offscreenReadbackBuffer = VK_NULL_HANDLE;
+    offscreenReadbackAllocation = {};
+
+    depthImage = VK_NULL_HANDLE;
+    depthImageAllocation = {};
+
+    if (graphicsPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(device, graphicsPipeline, nullptr);
+        graphicsPipeline = VK_NULL_HANDLE;
+    }
+    if (pipelineLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+        pipelineLayout = VK_NULL_HANDLE;
+    }
+    if (renderPass != VK_NULL_HANDLE)
+    {
+        vkDestroyRenderPass(device, renderPass, nullptr);
+        renderPass = VK_NULL_HANDLE;
+    }
+}
+
+void SplatCoreApp::resetFrameLoopStateForTesting()
+{
+    if (window != nullptr)
+    {
+        glfwSetWindowShouldClose(window, GLFW_FALSE);
+    }
+    framebufferResized = false;
+    currentFrame = 0;
+    frameCount = 0;
+    maxFrameCount = 0;
+    lastFpsTime = glfwGetTime();
+    lastFrameTime = lastFpsTime;
+    imagesInFlight.clear();
+    renderFinishedSemaphores.clear();
+    if (window != nullptr)
+    {
+        firstMouse = true;
     }
 }
 
@@ -1172,6 +1264,7 @@ void SplatCoreApp::createLogicalDevice()
     {
         throw std::runtime_error("Failed to create logical device.");
     }
+    std::fprintf(stdout, "VkDevice created\n");
 
     vkGetDeviceQueue(device, indices.graphicsFamily.value(), 0, &graphicsQueue);
     vkGetDeviceQueue(device, indices.presentFamily.value(), 0, &presentQueue);
@@ -2213,6 +2306,7 @@ void SplatCoreApp::createDepthResources()
                 depthFormat,
                 VK_IMAGE_TILING_OPTIMAL,
                 VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                    VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                     VK_IMAGE_USAGE_SAMPLED_BIT,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                 depthImage,
@@ -2669,7 +2763,9 @@ void SplatCoreApp::loadPointCloud()
                        stagingAllocation.vmaAllocation);
 
         createBuffer(bufferSize,
-                     VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                     VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                      pointVertexBuffer,
                      pointVertexBufferAllocation,

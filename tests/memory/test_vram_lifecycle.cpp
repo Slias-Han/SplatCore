@@ -3,12 +3,24 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <stdexcept>
 #include <vector>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 using namespace SplatCore;
 
 namespace {
+
+constexpr uint64_t kDeathTestStaticBudgetBytes = 1024 * 1024;
+constexpr uint64_t kDeathTestRequestBytes = kDeathTestStaticBudgetBytes + 1024;
 
 struct VulkanContext {
     VkInstance instance = VK_NULL_HANDLE;
@@ -159,22 +171,134 @@ void test_staging_no_reuse() {
     printf("[PASS] TEST 2: staging 立即释放\n");
 }
 
-// ━━━ TEST 3：空 AllocationName 触发 terminate（需捕获异常/信号）━━━
-// 此测试需要在独立进程中运行，或使用 death test 框架
-// 验证方式：检查调用 allocate() 时 allocationName 为空会触发 std::terminate
-// 在 CI 中可用：ASSERT_DEATH(MemorySystem::allocate(emptyDesc), "")
-void test_empty_name_terminates() {
-    // 在你的测试框架中验证以下代码会触发进程退出码非零：
-    // AllocationDesc bad{};
-    // bad.allocationName = "";  // 故意违规
-    // MemorySystem::allocate(bad);
-    printf("[PASS] TEST 3: 空 AllocationName 死亡红线已记录（需 death test 框架验证）\n");
+int run_over_budget_child()
+{
+    VulkanContext ctx = createVulkanContext();
+    MemorySystem::init(ctx.instance, ctx.physicalDevice, ctx.device);
+    MemorySystem::setStaticRegionBudgetForTesting(kDeathTestStaticBudgetBytes);
+
+    AllocationDesc desc{};
+    desc.region = MemoryRegion::STATIC;
+    desc.bufferUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    desc.vmaUsage = VMA_MEMORY_USAGE_GPU_ONLY;
+    desc.size = kDeathTestRequestBytes;
+    desc.allocationName = "Test::StaticOverBudget";
+    desc.imageInfo = nullptr;
+
+    std::printf("[TEST 3 CHILD] Triggering over-budget static allocation (%llu > %llu)\n",
+                static_cast<unsigned long long>(desc.size),
+                static_cast<unsigned long long>(kDeathTestStaticBudgetBytes));
+    std::fflush(stdout);
+
+    [[maybe_unused]] const Allocation allocation = MemorySystem::allocate(desc);
+
+    MemorySystem::resetStaticRegionBudgetForTesting();
+    MemorySystem::shutdown();
+    destroyVulkanContext(ctx);
+    return EXIT_SUCCESS;
+}
+
+bool test_static_budget_death(const char* executablePath)
+{
+    if (executablePath == nullptr || executablePath[0] == '\0')
+    {
+        std::printf("[FAIL] TEST 3: executable path unavailable\n");
+        return false;
+    }
+
+#ifdef _WIN32
+    std::string commandLine = "\"";
+    commandLine += executablePath;
+    commandLine += "\" --death-test-overbudget";
+
+    STARTUPINFOA startupInfo{};
+    startupInfo.cb = sizeof(startupInfo);
+    PROCESS_INFORMATION processInfo{};
+    std::vector<char> mutableCommandLine(commandLine.begin(), commandLine.end());
+    mutableCommandLine.push_back('\0');
+
+    const BOOL created = CreateProcessA(
+        nullptr,
+        mutableCommandLine.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        0,
+        nullptr,
+        nullptr,
+        &startupInfo,
+        &processInfo);
+
+    if (!created)
+    {
+        std::printf("[FAIL] TEST 3: CreateProcess failed (%lu)\n",
+                    static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+
+    WaitForSingleObject(processInfo.hProcess, INFINITE);
+
+    DWORD exitCode = 0;
+    const BOOL gotExitCode = GetExitCodeProcess(processInfo.hProcess, &exitCode);
+    CloseHandle(processInfo.hThread);
+    CloseHandle(processInfo.hProcess);
+
+    if (!gotExitCode)
+    {
+        std::printf("[FAIL] TEST 3: GetExitCodeProcess failed (%lu)\n",
+                    static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+
+    if (exitCode != EXIT_SUCCESS)
+    {
+        std::printf("[PASS] TEST 3 PASS: over-budget allocation terminated child process (exit=%lu)\n",
+                    static_cast<unsigned long>(exitCode));
+        return true;
+    }
+
+    std::printf("[FAIL] TEST 3: child survived over-budget allocation\n");
+    return false;
+#else
+    const pid_t pid = fork();
+    if (pid < 0)
+    {
+        std::printf("[FAIL] TEST 3: fork failed\n");
+        return false;
+    }
+    if (pid == 0)
+    {
+        execl(executablePath, executablePath, "--death-test-overbudget", nullptr);
+        _exit(127);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0)
+    {
+        std::printf("[FAIL] TEST 3: waitpid failed\n");
+        return false;
+    }
+
+    if (WIFSIGNALED(status) || (WIFEXITED(status) && WEXITSTATUS(status) != EXIT_SUCCESS))
+    {
+        std::printf("[PASS] TEST 3 PASS: over-budget allocation terminated child process\n");
+        return true;
+    }
+
+    std::printf("[FAIL] TEST 3: child survived over-budget allocation\n");
+    return false;
+#endif
 }
 
 } // namespace
 
-int main()
+int main(int argc, char* argv[])
 {
+    if (argc >= 2 && std::string(argv[1]) == "--death-test-overbudget")
+    {
+        return run_over_budget_child();
+    }
+
     VulkanContext ctx{};
     try
     {
@@ -183,7 +307,13 @@ int main()
 
         test_dynamic_flush();
         test_staging_no_reuse();
-        test_empty_name_terminates();
+        if (!test_static_budget_death(argv[0]))
+        {
+            MemorySystem::resetStaticRegionBudgetForTesting();
+            MemorySystem::shutdown();
+            destroyVulkanContext(ctx);
+            return EXIT_FAILURE;
+        }
 
         MemorySystem::shutdown();
         destroyVulkanContext(ctx);

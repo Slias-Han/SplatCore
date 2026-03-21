@@ -8,6 +8,8 @@
 
 namespace SplatCore {
 
+struct Allocation;
+
 enum class PoisonPattern : uint32_t {
     NAN_PATTERN = 0x7FC00000u,
     POS_INF = 0x7F800000u,
@@ -27,6 +29,8 @@ public:
                       VkDeviceSize bufferSize,
                       PoisonPattern pattern);
 
+    void poisonAll(PoisonPattern pattern);
+
     void shutdown();
 
     bool isReady() const { return m_pipeline != VK_NULL_HANDLE; }
@@ -35,6 +39,7 @@ private:
     VkDevice m_device = VK_NULL_HANDLE;
     VkQueue m_computeQueue = VK_NULL_HANDLE;
     VkCommandPool m_commandPool = VK_NULL_HANDLE;
+    VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_pipeline = VK_NULL_HANDLE;
@@ -42,6 +47,10 @@ private:
 
     std::vector<uint32_t> loadSpv(const char* path);
     void insertMemoryBarrier(VkCommandBuffer cmd);
+    void fillHostVisibleAllocation(const Allocation& allocation,
+                                   PoisonPattern pattern);
+    void poisonImage(const Allocation& allocation,
+                     PoisonPattern pattern);
 };
 
 } // namespace SplatCore

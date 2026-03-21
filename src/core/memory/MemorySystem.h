@@ -9,8 +9,9 @@
 #pragma once
 #include <vk_mem_alloc.h>
 #include <vulkan/vulkan.h>
-#include <string_view>
 #include <cstdint>
+#include <string_view>
+#include <vector>
 
 namespace SplatCore {
 
@@ -49,6 +50,9 @@ struct Allocation {
     VkDeviceSize  size;
     MemoryRegion  region;
     void*         mappedPtr;  // 若 VMA_ALLOCATION_CREATE_MAPPED_BIT 则非空，否则为 nullptr
+    VkFormat      imageFormat = VK_FORMAT_UNDEFINED;
+    VkExtent3D    imageExtent{};
+    VkImageUsageFlags imageUsage = 0;
 };
 
 // ─── MemorySystem 接口声明 ─────────────────────────────────────────────────
@@ -75,6 +79,19 @@ public:
     // 帧尾调用：强制回收所有 DYNAMIC 区域分配
     // 渲染循环必须在每帧结束时调用，不得跳过
     static void flushDynamicAllocations();
+
+    // 重置 STATIC 区域生命周期；保留 VkDevice / VmaAllocator。
+    static void destroyStaticRegion();
+    static void initStaticRegion();
+
+    // 测试辅助：为 STATIC 区域设置临时预算上限。
+    // 默认值为无限；仅供内存生命周期测试使用。
+    static void setStaticRegionBudgetForTesting(uint64_t budgetBytes);
+    static void resetStaticRegionBudgetForTesting();
+
+    // 只读快照：返回当前 STATIC + DYNAMIC 区域内的已分配对象。
+    [[nodiscard]]
+    static std::vector<Allocation> getAllocations();
 
     // 快照：填充 VramSnapshot，供日志系统调用
     [[nodiscard]]

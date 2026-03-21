@@ -140,110 +140,13 @@ void saveDiffReport(const char* patternName,
     std::fclose(file);
 }
 
-Allocation makeBufferAllocation(MemoryRegion region,
-                                VkBufferUsageFlags usage,
-                                VmaMemoryUsage vmaUsage,
-                                VkDeviceSize size,
-                                const char* name)
+RunResult renderCurrentScene(SplatCoreApp& app)
 {
-    AllocationDesc desc{};
-    desc.region = region;
-    desc.bufferUsage = usage;
-    desc.vmaUsage = vmaUsage;
-    desc.size = size;
-    desc.allocationName = name;
-    desc.imageInfo = nullptr;
-    return MemorySystem::allocate(desc);
-}
-
-RunResult runBaseline(const char* plyPath)
-{
-    SplatCoreApp app;
-    app.setPlyPath(plyPath);
-    app.initializeWindowForTesting();
-    app.initializeVulkanCoreForTesting();
-
     RunResult result{};
     result.physicalDeviceProperties = app.physicalDevicePropertiesForTesting();
-
-    app.initializeRenderResourcesForTesting();
     app.renderFramesForTesting(100);
     app.readbackOffscreenForTesting(result.pixels);
-    app.shutdownForTesting();
-
     return result;
-}
-
-RunResult runPoisoned(const char* plyPath,
-                      const char* spvDir,
-                      SplatCore::PoisonPattern pattern)
-{
-    SplatCoreApp app;
-    SplatCore::PoisonTestHarness harness;
-    Allocation stagingAllocation{};
-    Allocation staticAllocation{};
-    Allocation dynamicAllocation{};
-
-    try
-    {
-        app.setPlyPath(plyPath);
-        app.initializeWindowForTesting();
-        app.initializeVulkanCoreForTesting();
-
-        RunResult result{};
-        result.physicalDeviceProperties = app.physicalDevicePropertiesForTesting();
-
-        const std::string shaderPath = buildPoisonShaderPath(spvDir);
-        harness.init(app.deviceForTesting(),
-                     app.physicalDeviceForTesting(),
-                     app.commandPoolForTesting(),
-                     app.computeQueueForTesting(),
-                     shaderPath.c_str());
-
-        stagingAllocation = makeBufferAllocation(
-            MemoryRegion::STAGING,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            VMA_MEMORY_USAGE_CPU_ONLY,
-            1u << 20,
-            "PoisonTest::StagingScratch");
-        harness.poisonBuffer(stagingAllocation.buffer, stagingAllocation.size, pattern);
-        MemorySystem::free(stagingAllocation);
-
-        staticAllocation = makeBufferAllocation(
-            MemoryRegion::STATIC,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            VMA_MEMORY_USAGE_GPU_ONLY,
-            4u << 20,
-            "PoisonTest::StaticScratch");
-        harness.poisonBuffer(staticAllocation.buffer, staticAllocation.size, pattern);
-        MemorySystem::free(staticAllocation);
-
-        dynamicAllocation = makeBufferAllocation(
-            MemoryRegion::DYNAMIC,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            VMA_MEMORY_USAGE_GPU_ONLY,
-            1u << 20,
-            "PoisonTest::DynamicScratch");
-        harness.poisonBuffer(dynamicAllocation.buffer, dynamicAllocation.size, pattern);
-
-        app.initializeRenderResourcesForTesting();
-        harness.poisonBuffer(app.offscreenReadbackBufferForTesting(),
-                             app.offscreenReadbackBufferSizeForTesting(),
-                             pattern);
-
-        app.renderFramesForTesting(100);
-        app.readbackOffscreenForTesting(result.pixels);
-
-        harness.shutdown();
-        app.shutdownForTesting();
-        return result;
-    }
-    catch (...)
-    {
-        harness.shutdown();
-        app.shutdownForTesting();
-        throw;
-    }
 }
 
 } // namespace
@@ -260,17 +163,31 @@ int main(int argc, char* argv[])
     const char* plyPath = argv[1];
     const char* spvDir = (argc >= 3) ? argv[2] : "shaders";
 
+    SplatCoreApp app;
+    SplatCore::PoisonTestHarness harness;
     std::vector<uint32_t> baselinePixels;
     VkPhysicalDeviceProperties baselineProps{};
-
+    const std::string shaderPath = buildPoisonShaderPath(spvDir);
     try
     {
-        const RunResult baseline = runBaseline(plyPath);
+        app.setPlyPath(plyPath);
+        app.initializeWindowForTesting();
+        app.initializeVulkanCoreForTesting();
+        harness.init(app.deviceForTesting(),
+                     app.physicalDeviceForTesting(),
+                     app.commandPoolForTesting(),
+                     app.computeQueueForTesting(),
+                     shaderPath.c_str());
+        app.initializeRenderResourcesForTesting();
+
+        const RunResult baseline = renderCurrentScene(app);
         baselinePixels = baseline.pixels;
         baselineProps = baseline.physicalDeviceProperties;
     }
     catch (const std::exception& e)
     {
+        harness.shutdown();
+        app.shutdownForTesting();
         std::fprintf(stderr, "[FAIL] Baseline run failed: %s\n", e.what());
         return 1;
     }
@@ -292,7 +209,11 @@ int main(int argc, char* argv[])
 
         try
         {
-            const RunResult poisoned = runPoisoned(plyPath, spvDir, patterns[i]);
+            harness.poisonAll(patterns[i]);
+            app.resetRenderResourcesForTesting();
+            app.initializeRenderResourcesForTesting();
+
+            const RunResult poisoned = renderCurrentScene(app);
             poisonedPixels = poisoned.pixels;
 
             if (!samePhysicalDevice(baselineProps, poisoned.physicalDeviceProperties))
@@ -331,5 +252,7 @@ int main(int argc, char* argv[])
     }
 
     std::printf("\n=== VRAM 毒化测试结果: %d/4 通过 ===\n", 4 - failCount);
+    harness.shutdown();
+    app.shutdownForTesting();
     return failCount == 0 ? 0 : 1;
 }

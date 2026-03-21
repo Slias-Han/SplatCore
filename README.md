@@ -7,7 +7,7 @@ The current repository is still in the infrastructure stage: the active render p
 ## Current Status
 
 - `v0.5`: VMA-based 3-region memory partitioning and VRAM logging
-- `v0.6`: GPU VRAM poison test infrastructure, offscreen render target, CPU readback path, reusable `PoisonTestHarness`
+- `v0.6`: GPU VRAM poison test infrastructure, offscreen render target, CPU readback path, reusable `PoisonTestHarness`, single-`VkDevice` poison/baseline replay
 - `v0.7`: GPU-side SHA-256 hash probe, 100-frame consistency analysis, root-cause report generation, CI integration
 
 Current `v0.7` result on the shipped point-sprite path:
@@ -84,6 +84,12 @@ Available executables:
 - `SplatCore_PoisonTests`: v0.6 VRAM poison acceptance test
 - `SplatCore_SHA256Tests`: v0.7 SHA-256 consistency acceptance test
 
+Current regression expectations:
+
+- `SplatCore_MemoryLifecycleTests`: `3/3 PASS`, including a child-process death test for over-budget STATIC allocation
+- `SplatCore_PoisonTests`: `4/4 PASS`, baseline and poisoned runs share one `VkDevice`
+- `SplatCore_SHA256Tests`: returns `0` when the hash infrastructure is healthy
+
 Build all test targets:
 
 ```powershell
@@ -99,6 +105,12 @@ Run them:
 .\build\SplatCore_PoisonTests.exe .\tests\assets\poison_test_scene.ply .\build\shaders
 .\build\SplatCore_SHA256Tests.exe .\tests\assets\poison_test_scene.ply .\build\shaders
 ```
+
+`SplatCore_PoisonTests` now validates the intended v0.6 architecture:
+
+- baseline and poisoned replay happen on the same `VkDevice`
+- poison phase walks tracked STATIC + DYNAMIC allocations from `MemorySystem`
+- the harness logs `Poisoning N allocations (STATIC: X, DYNAMIC: Y)` before each pattern
 
 Acceptance rule for `SplatCore_SHA256Tests`:
 
@@ -160,10 +172,22 @@ Current CI baseline:
 
 - `Build Check` passes on Ubuntu 22.04
 - `VRAM Poison Test (M1 Gate)` passes on Ubuntu 22.04 with `llvmpipe + xvfb`
+- `SplatCore_MemoryLifecycleTests`: child-process over-budget death test passes
 - `SplatCore_PoisonTests`: `4/4 PASS`
 - `SplatCore_SHA256Tests`: passes and uploads `sha256_log.txt` / `sha256_rootcause.md`
 
 ## Changelog
+
+See also [CHANGELOG.md](/d:/GitHubProjects/SplatCore_SilasHan/CHANGELOG.md) for the rolling engineering log.
+
+### Unreleased - test hygiene and v0.6 compliance hardening
+
+- Added tracked-allocation poisoning for STATIC + DYNAMIC regions through `MemorySystem::getAllocations()`
+- Reworked `SplatCore_PoisonTests` so baseline and poisoned replay reuse a single `VkDevice`
+- Added poison log output in the form `Poisoning N allocations (STATIC: X, DYNAMIC: Y)`
+- Added a real child-process death test for STATIC over-budget allocation in `SplatCore_MemoryLifecycleTests`
+- Marked poison-test vertex buffers with `VK_BUFFER_USAGE_STORAGE_BUFFER_BIT` so Debug validation remains clean
+- Kept existing regression targets green: memory lifecycle, poison test, and SHA-256 consistency test
 
 ### v0.7 - SHA-256 VRAM bitwise consistency measurement
 
