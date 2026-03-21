@@ -139,6 +139,8 @@ public:
     void initializeRenderResourcesForTesting();
     void resetRenderResourcesForTesting();
     void renderFramesForTesting(uint32_t frameCount);
+    void renderDepthForTesting(const glm::mat4& view,
+                               std::vector<float>& outDepth);
     void readbackOffscreenForTesting(std::vector<uint32_t> &outPixels);
     void shutdownForTesting();
     void enableHashProbeForTesting(const std::string &spvPath);
@@ -155,6 +157,10 @@ public:
     {
         return offscreenReadbackAllocation.size;
     }
+    VkExtent2D renderExtentForTesting() const { return swapChainExtent; }
+    glm::vec3 sceneBoundsMinForTesting() const { return sceneBoundsMin; }
+    glm::vec3 sceneBoundsMaxForTesting() const { return sceneBoundsMax; }
+    bool sceneBoundsValidForTesting() const { return sceneBoundsValid; }
     VkPhysicalDeviceProperties physicalDevicePropertiesForTesting() const;
 
 private:
@@ -261,6 +267,7 @@ private:
 
     // FPS camera and mouse state
     Camera camera{};
+    std::optional<glm::mat4> testViewOverride;
     bool mouseCaptured = false;
     bool firstMouse = true;
     double lastMouseX = 0.0;
@@ -268,6 +275,9 @@ private:
 
     // PLY file path — set from argv before run()
     std::string plyFilePath;
+    glm::vec3 sceneBoundsMin{0.0f};
+    glm::vec3 sceneBoundsMax{0.0f};
+    bool sceneBoundsValid = false;
 
     std::atomic<bool> validationErrorDetected{false};
     std::string validationErrorMessage;
@@ -296,6 +306,7 @@ private:
     void createOffscreenTarget();
     void destroyOffscreenTarget();
     void readbackOffscreenFrame(std::vector<uint32_t> &outPixels);
+    void readbackDepthFrame(std::vector<float>& outDepth);
     void cleanupSwapChain();
     void recreateSwapChain();
     void createDepthResources();
@@ -443,6 +454,34 @@ void SplatCoreApp::renderFramesForTesting(uint32_t targetFrameCount)
     maxFrameCount = frameIndex + targetFrameCount - 1u;
     lastFrameTime = glfwGetTime();
     mainLoop();
+}
+
+void SplatCoreApp::renderDepthForTesting(const glm::mat4& view,
+                                         std::vector<float>& outDepth)
+{
+    testViewOverride = view;
+    try
+    {
+        if (window != nullptr)
+        {
+            glfwSetWindowShouldClose(window, GLFW_FALSE);
+        }
+        lastFrameTime = glfwGetTime();
+        drawFrame();
+        if (device != VK_NULL_HANDLE && vkDeviceWaitIdle(device) != VK_SUCCESS)
+        {
+            throw std::runtime_error("vkDeviceWaitIdle failed before depth readback.");
+        }
+        readbackDepthFrame(outDepth);
+        failIfValidationIssueDetected();
+    }
+    catch (...)
+    {
+        testViewOverride.reset();
+        throw;
+    }
+
+    testViewOverride.reset();
 }
 
 void SplatCoreApp::readbackOffscreenForTesting(std::vector<uint32_t> &outPixels)
@@ -870,6 +909,9 @@ void SplatCoreApp::destroyRenderResourcesPreserveDevice()
     pointVertexBuffer = VK_NULL_HANDLE;
     pointVertexBufferAllocation = {};
     pointCount = 0;
+    sceneBoundsValid = false;
+    sceneBoundsMin = glm::vec3(0.0f);
+    sceneBoundsMax = glm::vec3(0.0f);
 
     offscreenImage = VK_NULL_HANDLE;
     offscreenMemory = VK_NULL_HANDLE;
@@ -903,6 +945,7 @@ void SplatCoreApp::resetFrameLoopStateForTesting()
     {
         glfwSetWindowShouldClose(window, GLFW_FALSE);
     }
+    testViewOverride.reset();
     framebufferResized = false;
     currentFrame = 0;
     frameCount = 0;
@@ -1737,6 +1780,151 @@ void SplatCoreApp::readbackOffscreenFrame(std::vector<uint32_t> &outPixels)
                    offscreenReadbackAllocation.vmaAllocation);
 }
 
+void SplatCoreApp::readbackDepthFrame(std::vector<float>& outDepth)
+{
+    if (depthImage == VK_NULL_HANDLE)
+    {
+        throw std::runtime_error("Depth target is not initialized.");
+    }
+    if (depthImageAllocation.imageFormat != VK_FORMAT_D32_SFLOAT)
+    {
+        throw std::runtime_error("Depth readback currently requires VK_FORMAT_D32_SFLOAT.");
+    }
+
+    const size_t pixelCount =
+        static_cast<size_t>(swapChainExtent.width) *
+        static_cast<size_t>(swapChainExtent.height);
+    const VkDeviceSize byteSize =
+        static_cast<VkDeviceSize>(pixelCount) * sizeof(float);
+
+    AllocationDesc stagingDesc{};
+    stagingDesc.region = MemoryRegion::STAGING;
+    stagingDesc.bufferUsage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    stagingDesc.vmaUsage = VMA_MEMORY_USAGE_CPU_ONLY;
+    stagingDesc.size = byteSize;
+    stagingDesc.allocationName = "EpsilonProbe::DepthReadbackBuffer";
+    stagingDesc.imageInfo = nullptr;
+
+    Allocation stagingAllocation = MemorySystem::allocate(stagingDesc);
+    outDepth.resize(pixelCount);
+
+    try
+    {
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+        VkImageMemoryBarrier toTransferSrc{};
+        toTransferSrc.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        toTransferSrc.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        toTransferSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        toTransferSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toTransferSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toTransferSrc.image = depthImage;
+        toTransferSrc.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        toTransferSrc.subresourceRange.baseMipLevel = 0;
+        toTransferSrc.subresourceRange.levelCount = 1;
+        toTransferSrc.subresourceRange.baseArrayLayer = 0;
+        toTransferSrc.subresourceRange.layerCount = 1;
+        toTransferSrc.srcAccessMask =
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        toTransferSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+        vkCmdPipelineBarrier(commandBuffer,
+                             VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0,
+                             0, nullptr,
+                             0, nullptr,
+                             1, &toTransferSrc);
+
+        VkBufferImageCopy copyRegion{};
+        copyRegion.bufferOffset = 0;
+        copyRegion.bufferRowLength = 0;
+        copyRegion.bufferImageHeight = 0;
+        copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        copyRegion.imageSubresource.mipLevel = 0;
+        copyRegion.imageSubresource.baseArrayLayer = 0;
+        copyRegion.imageSubresource.layerCount = 1;
+        copyRegion.imageExtent = {
+            swapChainExtent.width,
+            swapChainExtent.height,
+            1};
+
+        vkCmdCopyImageToBuffer(commandBuffer,
+                               depthImage,
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               stagingAllocation.buffer,
+                               1,
+                               &copyRegion);
+
+        VkBufferMemoryBarrier bufferToHost{};
+        bufferToHost.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        bufferToHost.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        bufferToHost.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        bufferToHost.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bufferToHost.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bufferToHost.buffer = stagingAllocation.buffer;
+        bufferToHost.offset = 0;
+        bufferToHost.size = byteSize;
+
+        vkCmdPipelineBarrier(commandBuffer,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_HOST_BIT,
+                             0,
+                             0, nullptr,
+                             1, &bufferToHost,
+                             0, nullptr);
+
+        VkImageMemoryBarrier backToDepthAttachment{};
+        backToDepthAttachment.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        backToDepthAttachment.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        backToDepthAttachment.newLayout =
+            VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        backToDepthAttachment.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        backToDepthAttachment.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        backToDepthAttachment.image = depthImage;
+        backToDepthAttachment.subresourceRange.aspectMask =
+            VK_IMAGE_ASPECT_DEPTH_BIT;
+        backToDepthAttachment.subresourceRange.baseMipLevel = 0;
+        backToDepthAttachment.subresourceRange.levelCount = 1;
+        backToDepthAttachment.subresourceRange.baseArrayLayer = 0;
+        backToDepthAttachment.subresourceRange.layerCount = 1;
+        backToDepthAttachment.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        backToDepthAttachment.dstAccessMask =
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+        vkCmdPipelineBarrier(commandBuffer,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                             0,
+                             0, nullptr,
+                             0, nullptr,
+                             1, &backToDepthAttachment);
+
+        endSingleTimeCommands(commandBuffer);
+
+        void *mappedData = nullptr;
+        if (vmaMapMemory(MemorySystem::allocator(),
+                         stagingAllocation.vmaAllocation,
+                         &mappedData) != VK_SUCCESS)
+        {
+            throw std::runtime_error("Failed to map depth readback buffer.");
+        }
+
+        std::memcpy(outDepth.data(), mappedData, static_cast<size_t>(byteSize));
+        vmaUnmapMemory(MemorySystem::allocator(),
+                       stagingAllocation.vmaAllocation);
+    }
+    catch (...)
+    {
+        destroyBufferAllocation(stagingAllocation.buffer, stagingAllocation);
+        throw;
+    }
+
+    destroyBufferAllocation(stagingAllocation.buffer, stagingAllocation);
+}
+
 void SplatCoreApp::recordCommandBuffer(VkCommandBuffer cmdBuffer, uint32_t imageIndex)
 {
     VkCommandBufferBeginInfo beginInfo{};
@@ -2336,6 +2524,9 @@ void SplatCoreApp::loadPointCloud()
     // Reload-safe: release previous point cloud ownership before reallocation.
     destroyBufferAllocation(pointVertexBuffer, pointVertexBufferAllocation);
     pointCount = 0;
+    sceneBoundsValid = false;
+    sceneBoundsMin = glm::vec3(0.0f);
+    sceneBoundsMax = glm::vec3(0.0f);
 
     std::ifstream file(plyFilePath, std::ios::binary);
     if (!file.is_open())
@@ -2735,6 +2926,17 @@ void SplatCoreApp::loadPointCloud()
                   << std::endl;
     }
     pointCount = vertexCount;
+    sceneBoundsValid = !vertices.empty();
+    if (sceneBoundsValid)
+    {
+        sceneBoundsMin = vertices.front().pos;
+        sceneBoundsMax = vertices.front().pos;
+        for (const Vertex& vertex : vertices)
+        {
+            sceneBoundsMin = glm::min(sceneBoundsMin, vertex.pos);
+            sceneBoundsMax = glm::max(sceneBoundsMax, vertex.pos);
+        }
+    }
 
     // ── Upload via staging buffer ─────────────────────────────────────────
     const VkDeviceSize bufferSize = sizeof(Vertex) * vertices.size();
@@ -2944,8 +3146,8 @@ void SplatCoreApp::updateUniformBuffer(uint32_t frameSlot)
     // Model: identity — point cloud coordinates are already in world space.
     ubo.model = glm::mat4(1.0f);
 
-    // View: FPS camera.
-    ubo.view = camera.getView();
+    // View: FPS camera, unless a testing override has been injected.
+    ubo.view = testViewOverride.has_value() ? *testViewOverride : camera.getView();
 
     // Projection: 60° FOV, current aspect ratio, wide depth range for large scenes.
     ubo.proj = glm::perspective(

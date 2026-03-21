@@ -93,6 +93,28 @@ jobs:
           shaders
       timeout-minutes: 10
 
+    - name: Build EpsilonTests
+      run: cmake --build build --config Release --target SplatCore_EpsilonTests
+
+    - name: Run EpsilonTests
+      env:
+        EPSILON_TEST_POSES: "3"
+      run: |
+        cd build
+        xvfb-run -a ./SplatCore_EpsilonTests \
+          ../tests/assets/fragment.ply \
+          ./shaders
+      timeout-minutes: 10
+
+    - name: Upload epsilon report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: epsilon-report-${{ github.run_id }}
+        path: |
+          build/epsilon_report.md
+        retention-days: 14
+
     - name: Upload SHA256 Reports
       if: always()
       uses: actions/upload-artifact@v4
@@ -101,4 +123,5 @@ jobs:
         path: |
           build/sha256_log.txt
           build/sha256_rootcause.md
+          build/epsilon_report.md
         retention-days: 14
