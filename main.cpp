@@ -516,10 +516,14 @@ void SplatCoreApp::initRenderResources()
     failIfValidationIssueDetected();
 
     const char* hashProbeEnv = nullptr;
+#ifdef _MSC_VER
 #pragma warning(push)
 #pragma warning(disable: 4996)
+#endif
     hashProbeEnv = std::getenv("SPLATCORE_HASH_PROBE");
+#ifdef _MSC_VER
 #pragma warning(pop)
+#endif
     const bool enableHashProbeFromEnv =
         hashProbeEnv != nullptr && std::string(hashProbeEnv) == "1";
     if (enableHashProbeFromEnv || hashProbeRequested)

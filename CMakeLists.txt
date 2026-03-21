@@ -22,8 +22,8 @@ if(WIN32)
         NOMINMAX
     )
 elseif(UNIX AND NOT APPLE)
-    add_compile_definitions(VK_USE_PLATFORM_XCB_KHR)
-    # xcb is the correct Vulkan surface extension for Linux CI (llvmpipe supports it)
+    add_compile_definitions(VK_USE_PLATFORM_XLIB_KHR)
+    # xlib is the correct Vulkan surface extension for Linux CI (llvmpipe supports it)
 endif()
 
 find_package(Vulkan REQUIRED)
