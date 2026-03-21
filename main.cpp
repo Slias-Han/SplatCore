@@ -380,6 +380,7 @@ SplatCoreApp::~SplatCoreApp()
 
 void SplatCoreApp::run()
 {
+#ifdef _MSC_VER
     char* envValue = nullptr;
     size_t envValueLength = 0;
     if (_dupenv_s(&envValue, &envValueLength, "SPLATCORE_MAX_FRAMES") == 0 &&
@@ -392,6 +393,17 @@ void SplatCoreApp::run()
         }
     }
     std::free(envValue);
+#else
+    const char* envValue = std::getenv("SPLATCORE_MAX_FRAMES");
+    if (envValue != nullptr)
+    {
+        const unsigned long parsedValue = std::strtoul(envValue, nullptr, 10);
+        if (parsedValue > 0)
+        {
+            maxFrameCount = static_cast<uint32_t>(parsedValue);
+        }
+    }
+#endif
 
     initWindow();
     initVulkan();
