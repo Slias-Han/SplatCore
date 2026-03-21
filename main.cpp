@@ -2225,16 +2225,174 @@ void SplatCoreApp::loadPointCloud()
     if (!file.is_open())
         throw std::runtime_error("Failed to open PLY file: " + plyFilePath);
 
-    // ── Parse ASCII header ────────────────────────────────────────────────
-    struct PropInfo
+    enum class PlyFormat
+    {
+        ASCII,
+        BinaryLittleEndian,
+        BinaryBigEndian
+    };
+    struct PlyProperty
     {
         std::string name;
-        size_t offset;
+        std::string type;
+        bool isList = false;
+        std::string listCountType;
+        std::string listValueType;
+        size_t offset = 0;
+        size_t size = 0;
     };
-    std::vector<PropInfo> properties;
-    size_t bytesPerVertex = 0;
+    struct PlyElement
+    {
+        std::string name;
+        uint32_t count = 0;
+        std::vector<PlyProperty> properties;
+        size_t stride = 0;
+    };
+
+    auto scalarTypeSize = [](const std::string &type) -> size_t
+    {
+        if (type == "char" || type == "uchar" ||
+            type == "int8" || type == "uint8")
+            return 1;
+        if (type == "short" || type == "ushort" ||
+            type == "int16" || type == "uint16")
+            return 2;
+        if (type == "int" || type == "uint" ||
+            type == "int32" || type == "uint32" ||
+            type == "float" || type == "float32")
+            return 4;
+        if (type == "double" || type == "float64")
+            return 8;
+        throw std::runtime_error("Unsupported PLY scalar type: " + type);
+    };
+    auto isIntegerType = [](const std::string &type) -> bool
+    {
+        return type == "char" || type == "uchar" ||
+               type == "int8" || type == "uint8" ||
+               type == "short" || type == "ushort" ||
+               type == "int16" || type == "uint16" ||
+               type == "int" || type == "uint" ||
+               type == "int32" || type == "uint32";
+    };
+    auto integerTypeMax = [](const std::string &type) -> double
+    {
+        if (type == "uchar" || type == "uint8")
+            return 255.0;
+        if (type == "char" || type == "int8")
+            return 127.0;
+        if (type == "ushort" || type == "uint16")
+            return 65535.0;
+        if (type == "short" || type == "int16")
+            return 32767.0;
+        if (type == "uint" || type == "uint32")
+            return static_cast<double>(std::numeric_limits<uint32_t>::max());
+        if (type == "int" || type == "int32")
+            return static_cast<double>(std::numeric_limits<int32_t>::max());
+        return 1.0;
+    };
+    auto hostIsLittleEndian = []() -> bool
+    {
+        const uint16_t value = 1;
+        return *reinterpret_cast<const uint8_t *>(&value) == 1;
+    };
+    auto fileNeedsByteSwap = [&](PlyFormat format) -> bool
+    {
+        if (format == PlyFormat::ASCII)
+            return false;
+        return hostIsLittleEndian()
+                   ? (format == PlyFormat::BinaryBigEndian)
+                   : (format == PlyFormat::BinaryLittleEndian);
+    };
+    auto scalarFromBytes = [&](const char *src,
+                               const std::string &type,
+                               PlyFormat format) -> double
+    {
+        std::array<uint8_t, 8> raw{};
+        const size_t size = scalarTypeSize(type);
+        std::memcpy(raw.data(), src, size);
+        if (fileNeedsByteSwap(format) && size > 1)
+            std::reverse(raw.begin(), raw.begin() + static_cast<std::ptrdiff_t>(size));
+
+        if (type == "char" || type == "int8")
+        {
+            int8_t value = 0;
+            std::memcpy(&value, raw.data(), sizeof(value));
+            return static_cast<double>(value);
+        }
+        if (type == "uchar" || type == "uint8")
+        {
+            uint8_t value = 0;
+            std::memcpy(&value, raw.data(), sizeof(value));
+            return static_cast<double>(value);
+        }
+        if (type == "short" || type == "int16")
+        {
+            int16_t value = 0;
+            std::memcpy(&value, raw.data(), sizeof(value));
+            return static_cast<double>(value);
+        }
+        if (type == "ushort" || type == "uint16")
+        {
+            uint16_t value = 0;
+            std::memcpy(&value, raw.data(), sizeof(value));
+            return static_cast<double>(value);
+        }
+        if (type == "int" || type == "int32")
+        {
+            int32_t value = 0;
+            std::memcpy(&value, raw.data(), sizeof(value));
+            return static_cast<double>(value);
+        }
+        if (type == "uint" || type == "uint32")
+        {
+            uint32_t value = 0;
+            std::memcpy(&value, raw.data(), sizeof(value));
+            return static_cast<double>(value);
+        }
+        if (type == "float" || type == "float32")
+        {
+            float value = 0.0f;
+            std::memcpy(&value, raw.data(), sizeof(value));
+            return static_cast<double>(value);
+        }
+        if (type == "double" || type == "float64")
+        {
+            double value = 0.0;
+            std::memcpy(&value, raw.data(), sizeof(value));
+            return value;
+        }
+
+        throw std::runtime_error("Unsupported PLY scalar type: " + type);
+    };
+    auto scalarFromToken = [&](const std::string &token,
+                               const std::string &type) -> double
+    {
+        if (type == "char" || type == "int8" ||
+            type == "short" || type == "int16" ||
+            type == "int" || type == "int32")
+        {
+            return static_cast<double>(std::stoll(token));
+        }
+        if (type == "uchar" || type == "uint8" ||
+            type == "ushort" || type == "uint16" ||
+            type == "uint" || type == "uint32")
+        {
+            return static_cast<double>(std::stoull(token));
+        }
+        return std::stod(token);
+    };
+    auto normalizeColor = [&](double value, const std::string &type) -> float
+    {
+        if (isIntegerType(type))
+            value /= integerTypeMax(type);
+        return std::clamp(static_cast<float>(value), 0.0f, 1.0f);
+    };
+
+    std::vector<PlyElement> elements;
+    PlyElement *currentElement = nullptr;
+    PlyFormat format = PlyFormat::ASCII;
+    bool formatSeen = false;
     uint32_t vertexCount = 0;
-    bool isBinary = false;
 
     std::string line;
     while (std::getline(file, line))
@@ -2253,103 +2411,212 @@ void SplatCoreApp::loadPointCloud()
         {
             std::string fmt;
             iss >> fmt;
-            isBinary = (fmt == "binary_little_endian" ||
-                        fmt == "binary_big_endian");
+            if (fmt == "ascii")
+                format = PlyFormat::ASCII;
+            else if (fmt == "binary_little_endian")
+                format = PlyFormat::BinaryLittleEndian;
+            else if (fmt == "binary_big_endian")
+                format = PlyFormat::BinaryBigEndian;
+            else
+                throw std::runtime_error("Unsupported PLY format: " + fmt);
+            formatSeen = true;
         }
         else if (token == "element")
         {
             std::string elem;
-            iss >> elem;
+            uint32_t count = 0;
+            iss >> elem >> count;
+            elements.push_back({elem, count});
+            currentElement = &elements.back();
             if (elem == "vertex")
-                iss >> vertexCount;
+                vertexCount = count;
         }
         else if (token == "property")
         {
-            std::string typeStr, nameStr;
-            iss >> typeStr >> nameStr;
-            // All 3DGS properties are float (4 bytes)
-            properties.push_back({nameStr, bytesPerVertex});
-            bytesPerVertex += 4;
+            if (currentElement == nullptr)
+                continue;
+
+            std::string typeOrList;
+            iss >> typeOrList;
+
+            PlyProperty prop{};
+            if (typeOrList == "list")
+            {
+                prop.isList = true;
+                iss >> prop.listCountType >> prop.listValueType >> prop.name;
+            }
+            else
+            {
+                prop.type = typeOrList;
+                iss >> prop.name;
+                prop.size = scalarTypeSize(prop.type);
+                prop.offset = currentElement->stride;
+                currentElement->stride += prop.size;
+            }
+
+            currentElement->properties.push_back(prop);
         }
     }
 
-    if (!isBinary)
-        throw std::runtime_error("Only binary_little_endian PLY is supported.");
+    if (!formatSeen)
+        throw std::runtime_error("PLY header missing format.");
     if (vertexCount == 0)
         throw std::runtime_error("PLY has no vertices.");
 
-    // Find byte offsets for the six fields we need
-    int offX = -1, offY = -1, offZ = -1;
-    int offR = -1, offG = -1, offB = -1;
-    for (const PropInfo &p : properties)
+    const PlyElement *vertexElement = nullptr;
+    for (const PlyElement &element : elements)
     {
-        const int off = static_cast<int>(p.offset);
-        if (p.name == "x")
-            offX = off;
-        else if (p.name == "y")
-            offY = off;
-        else if (p.name == "z")
-            offZ = off;
-        else if (p.name == "f_dc_0")
-            offR = off;
-        else if (p.name == "f_dc_1")
-            offG = off;
-        else if (p.name == "f_dc_2")
-            offB = off;
+        if (element.name == "vertex")
+        {
+            vertexElement = &element;
+            break;
+        }
     }
-    if (offX < 0 || offY < 0 || offZ < 0)
+    if (vertexElement == nullptr)
+        throw std::runtime_error("PLY missing vertex element.");
+
+    const PlyProperty *propX = nullptr;
+    const PlyProperty *propY = nullptr;
+    const PlyProperty *propZ = nullptr;
+    const PlyProperty *propR = nullptr;
+    const PlyProperty *propG = nullptr;
+    const PlyProperty *propB = nullptr;
+    const PlyProperty *propShR = nullptr;
+    const PlyProperty *propShG = nullptr;
+    const PlyProperty *propShB = nullptr;
+    for (const PlyProperty &property : vertexElement->properties)
+    {
+        if (property.isList)
+            throw std::runtime_error("PLY vertex list properties are not supported.");
+
+        if (property.name == "x")
+            propX = &property;
+        else if (property.name == "y")
+            propY = &property;
+        else if (property.name == "z")
+            propZ = &property;
+        else if (property.name == "red")
+            propR = &property;
+        else if (property.name == "green")
+            propG = &property;
+        else if (property.name == "blue")
+            propB = &property;
+        else if (property.name == "f_dc_0")
+            propShR = &property;
+        else if (property.name == "f_dc_1")
+            propShG = &property;
+        else if (property.name == "f_dc_2")
+            propShB = &property;
+    }
+    if (propX == nullptr || propY == nullptr || propZ == nullptr)
         throw std::runtime_error("PLY missing x/y/z properties.");
 
-    // ── Read binary data body ─────────────────────────────────────────────
-    const size_t totalBytes = static_cast<size_t>(vertexCount) * bytesPerVertex;
-    std::vector<char> rawData(totalBytes);
-    file.read(rawData.data(), static_cast<std::streamsize>(totalBytes));
-    if (!file)
-        throw std::runtime_error("PLY binary read failed (truncated?).");
-    file.close();
-
-    std::cout << "[PLY] Parsed " << vertexCount << " vertices ("
-              << (totalBytes >> 20) << " MB raw)" << std::endl;
-
-    // ── Build Vertex array ────────────────────────────────────────────────
-    // SH DC → linear RGB: c = clamp(0.5 + 0.2820947918 * f_dc, 0, 1)
+    const bool hasRgb = (propR != nullptr && propG != nullptr && propB != nullptr);
+    const bool hasShDc = (propShR != nullptr || propShG != nullptr || propShB != nullptr);
     constexpr float kSH0 = 0.2820947918f;
 
     std::vector<Vertex> vertices(vertexCount);
-    for (uint32_t i = 0; i < vertexCount; ++i)
+    if (format == PlyFormat::ASCII)
     {
-        const char *base = rawData.data() +
-                           static_cast<size_t>(i) * bytesPerVertex;
-
-        float x, y, z;
-        std::memcpy(&x, base + offX, sizeof(float));
-        std::memcpy(&y, base + offY, sizeof(float));
-        std::memcpy(&z, base + offZ, sizeof(float));
-
-        float r = 0.5f, g = 0.5f, b = 0.5f; // grey fallback if no color
-        if (offR >= 0)
+        for (uint32_t i = 0; i < vertexCount; ++i)
         {
-            float v;
-            std::memcpy(&v, base + offR, sizeof(float));
-            r = 0.5f + kSH0 * v;
-        }
-        if (offG >= 0)
-        {
-            float v;
-            std::memcpy(&v, base + offG, sizeof(float));
-            g = 0.5f + kSH0 * v;
-        }
-        if (offB >= 0)
-        {
-            float v;
-            std::memcpy(&v, base + offB, sizeof(float));
-            b = 0.5f + kSH0 * v;
-        }
+            if (!std::getline(file, line))
+                throw std::runtime_error("PLY ASCII read failed (truncated?).");
+            if (!line.empty() && line.back() == '\r')
+                line.pop_back();
 
-        vertices[i].pos = {x, y, z};
-        vertices[i].color = {std::clamp(r, 0.0f, 1.0f),
-                             std::clamp(g, 0.0f, 1.0f),
-                             std::clamp(b, 0.0f, 1.0f)};
+            std::istringstream row(line);
+            double x = 0.0;
+            double y = 0.0;
+            double z = 0.0;
+            float r = 0.5f;
+            float g = 0.5f;
+            float b = 0.5f;
+
+            for (const PlyProperty &property : vertexElement->properties)
+            {
+                std::string tokenValue;
+                if (!(row >> tokenValue))
+                    throw std::runtime_error("PLY ASCII vertex row is incomplete.");
+
+                const double value = scalarFromToken(tokenValue, property.type);
+                if (property.name == "x")
+                    x = value;
+                else if (property.name == "y")
+                    y = value;
+                else if (property.name == "z")
+                    z = value;
+                else if (hasRgb && property.name == "red")
+                    r = normalizeColor(value, property.type);
+                else if (hasRgb && property.name == "green")
+                    g = normalizeColor(value, property.type);
+                else if (hasRgb && property.name == "blue")
+                    b = normalizeColor(value, property.type);
+                else if (!hasRgb && property.name == "f_dc_0")
+                    r = std::clamp(0.5f + kSH0 * static_cast<float>(value), 0.0f, 1.0f);
+                else if (!hasRgb && property.name == "f_dc_1")
+                    g = std::clamp(0.5f + kSH0 * static_cast<float>(value), 0.0f, 1.0f);
+                else if (!hasRgb && property.name == "f_dc_2")
+                    b = std::clamp(0.5f + kSH0 * static_cast<float>(value), 0.0f, 1.0f);
+            }
+
+            vertices[i].pos = {static_cast<float>(x),
+                               static_cast<float>(y),
+                               static_cast<float>(z)};
+            vertices[i].color = {r, g, b};
+        }
+    }
+    else
+    {
+        const size_t totalBytes = static_cast<size_t>(vertexCount) * vertexElement->stride;
+        std::vector<char> rawData(totalBytes);
+        file.read(rawData.data(), static_cast<std::streamsize>(totalBytes));
+        if (!file)
+            throw std::runtime_error("PLY binary read failed (truncated?).");
+
+        std::cout << "[PLY] Parsed " << vertexCount << " vertices ("
+                  << (totalBytes >> 20) << " MB raw)" << std::endl;
+
+        for (uint32_t i = 0; i < vertexCount; ++i)
+        {
+            const char *base = rawData.data() +
+                               static_cast<size_t>(i) * vertexElement->stride;
+
+            const double x = scalarFromBytes(base + propX->offset, propX->type, format);
+            const double y = scalarFromBytes(base + propY->offset, propY->type, format);
+            const double z = scalarFromBytes(base + propZ->offset, propZ->type, format);
+
+            float r = 0.5f;
+            float g = 0.5f;
+            float b = 0.5f;
+            if (hasRgb)
+            {
+                r = normalizeColor(scalarFromBytes(base + propR->offset, propR->type, format), propR->type);
+                g = normalizeColor(scalarFromBytes(base + propG->offset, propG->type, format), propG->type);
+                b = normalizeColor(scalarFromBytes(base + propB->offset, propB->type, format), propB->type);
+            }
+            else if (hasShDc)
+            {
+                if (propShR != nullptr)
+                    r = std::clamp(0.5f + kSH0 * static_cast<float>(scalarFromBytes(base + propShR->offset, propShR->type, format)), 0.0f, 1.0f);
+                if (propShG != nullptr)
+                    g = std::clamp(0.5f + kSH0 * static_cast<float>(scalarFromBytes(base + propShG->offset, propShG->type, format)), 0.0f, 1.0f);
+                if (propShB != nullptr)
+                    b = std::clamp(0.5f + kSH0 * static_cast<float>(scalarFromBytes(base + propShB->offset, propShB->type, format)), 0.0f, 1.0f);
+            }
+
+            vertices[i].pos = {static_cast<float>(x),
+                               static_cast<float>(y),
+                               static_cast<float>(z)};
+            vertices[i].color = {r, g, b};
+        }
+    }
+    file.close();
+
+    if (format == PlyFormat::ASCII)
+    {
+        std::cout << "[PLY] Parsed " << vertexCount << " vertices (ASCII)"
+                  << std::endl;
     }
     pointCount = vertexCount;
 
