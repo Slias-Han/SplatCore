@@ -38,6 +38,7 @@ jobs:
           libglfw3-dev \
           libglm-dev \
           libx11-dev \
+          xvfb \
           cmake ninja-build
 
     - name: Force llvmpipe (no GPU required)
@@ -68,7 +69,7 @@ jobs:
     - name: Run VRAM Poison Test
       run: |
         cd build
-        ./SplatCore_PoisonTests \
+        xvfb-run -a ./SplatCore_PoisonTests \
           ../tests/assets/poison_test_scene.ply \
           shaders
       timeout-minutes: 10
@@ -87,7 +88,7 @@ jobs:
     - name: Run SHA256 Consistency Test
       run: |
         cd build
-        ./SplatCore_SHA256Tests \
+        xvfb-run -a ./SplatCore_SHA256Tests \
           ../tests/assets/poison_test_scene.ply \
           shaders
       timeout-minutes: 10
