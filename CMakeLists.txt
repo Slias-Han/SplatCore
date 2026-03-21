@@ -84,6 +84,17 @@ add_custom_command(
 )
 list(APPEND SHADER_OUTPUTS "${CMAKE_BINARY_DIR}/shaders/sha256_compute.spv")
 
+add_custom_command(
+    OUTPUT "${CMAKE_BINARY_DIR}/shaders/sha256_depth_compute.spv"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shaders"
+    COMMAND "${GLSLC_EXECUTABLE}"
+        "${CMAKE_SOURCE_DIR}/shaders/sha256_depth_compute.comp"
+        -o "${CMAKE_BINARY_DIR}/shaders/sha256_depth_compute.spv"
+    DEPENDS "${CMAKE_SOURCE_DIR}/shaders/sha256_depth_compute.comp"
+    VERBATIM
+)
+list(APPEND SHADER_OUTPUTS "${CMAKE_BINARY_DIR}/shaders/sha256_depth_compute.spv")
+
 add_custom_target(SplatCore_Shaders ALL DEPENDS ${SHADER_OUTPUTS})
 # ─────────────────────────────────────────────────────────────────────────
 

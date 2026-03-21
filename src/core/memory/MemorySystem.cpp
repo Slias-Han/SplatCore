@@ -91,6 +91,8 @@ void MemorySystem::shutdown()
 
 Allocation MemorySystem::allocate(const AllocationDesc& desc)
 {
+    // TODO(P1): replace std::terminate with structured MemoryError return to
+    //           allow tests to validate budget overflow without process death
     if (desc.allocationName.empty())
     {
         // AllocationName 为空是架构违规，不允许恢复

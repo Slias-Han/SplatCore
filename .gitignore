@@ -60,3 +60,12 @@ CMakeFiles/
 cmake_install.cmake
 
 install_manifest.txt
+
+# Local release builds
+build-release/
+# Debug log archives
+*_logs.zip
+# Binary test artifacts
+poison_test_baseline.bin
+# Large PLY assets (use Git LFS or keep local)
+tests/assets/point_cloud.ply

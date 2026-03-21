@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 
 namespace SplatCore {
 
@@ -39,12 +40,107 @@ uint32_t findMemoryTypeIndex(VkPhysicalDevice physicalDevice,
     throw std::runtime_error("Failed to find suitable memory type for HashProbe.");
 }
 
-bool hashesMatch(const FrameHash& a, const FrameHash& b)
+VkShaderModule createShaderModule(VkDevice device, const std::vector<uint32_t>& code)
+{
+    VkShaderModuleCreateInfo shaderModuleInfo{};
+    shaderModuleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    shaderModuleInfo.codeSize = code.size() * sizeof(uint32_t);
+    shaderModuleInfo.pCode = code.data();
+
+    VkShaderModule shaderModule = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(device, &shaderModuleInfo, nullptr, &shaderModule) !=
+        VK_SUCCESS)
+    {
+        throw std::runtime_error("Failed to create HashProbe shader module.");
+    }
+
+    return shaderModule;
+}
+
+void createHostVisibleHashBuffer(VkDevice device,
+                                 VkPhysicalDevice physicalDevice,
+                                 VkBuffer& buffer,
+                                 VkDeviceMemory& memory)
+{
+    VkBufferCreateInfo bufferInfo{};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = sizeof(uint32_t) * 8u;
+    bufferInfo.usage =
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    if (vkCreateBuffer(device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS)
+    {
+        throw std::runtime_error("Failed to create HashProbe hash buffer.");
+    }
+
+    VkMemoryRequirements memRequirements{};
+    vkGetBufferMemoryRequirements(device, buffer, &memRequirements);
+
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memRequirements.size;
+    allocInfo.memoryTypeIndex = findMemoryTypeIndex(
+        physicalDevice,
+        memRequirements.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    if (vkAllocateMemory(device, &allocInfo, nullptr, &memory) != VK_SUCCESS)
+    {
+        throw std::runtime_error("Failed to allocate HashProbe hash memory.");
+    }
+
+    if (vkBindBufferMemory(device, buffer, memory, 0) != VK_SUCCESS)
+    {
+        throw std::runtime_error("Failed to bind HashProbe hash buffer memory.");
+    }
+}
+
+std::string deriveSiblingSpvPath(const char* basePath, const char* siblingFileName)
+{
+    if (basePath == nullptr || basePath[0] == '\0')
+    {
+        return siblingFileName;
+    }
+
+    std::string path = basePath;
+    const size_t slashPos = path.find_last_of("/\\");
+    if (slashPos == std::string::npos)
+    {
+        return siblingFileName;
+    }
+
+    path.resize(slashPos + 1u);
+    path += siblingFileName;
+    return path;
+}
+
+bool colorHashesMatch(const FrameHash& a, const FrameHash& b)
 {
     return std::memcmp(a.colorHash, b.colorHash, sizeof(a.colorHash)) == 0;
 }
 
+bool depthHashesMatch(const FrameHash& a, const FrameHash& b)
+{
+    return a.depthHash == b.depthHash;
+}
+
+bool hasDepthHashes(const std::vector<FrameHash>& hashes)
+{
+    for (const FrameHash& hash : hashes)
+    {
+        if (hash.depthHash != 0u)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+using HashMatchFn = bool (*)(const FrameHash&, const FrameHash&);
+
 int countMatchingFramesExcludingBaseline(const std::vector<FrameHash>& hashes,
+                                         HashMatchFn matches,
                                          std::vector<uint32_t>* divergedFrames)
 {
     if (divergedFrames != nullptr)
@@ -61,7 +157,7 @@ int countMatchingFramesExcludingBaseline(const std::vector<FrameHash>& hashes,
 
     for (size_t i = 1; i < hashes.size(); ++i)
     {
-        if (hashesMatch(baseline, hashes[i]))
+        if (matches(baseline, hashes[i]))
         {
             ++consistentCount;
         }
@@ -74,6 +170,34 @@ int countMatchingFramesExcludingBaseline(const std::vector<FrameHash>& hashes,
     return consistentCount;
 }
 
+int countMatchingFramesIncludingBaseline(const std::vector<FrameHash>& hashes,
+                                         HashMatchFn matches)
+{
+    if (hashes.empty())
+    {
+        return 0;
+    }
+
+    return countMatchingFramesExcludingBaseline(hashes, matches, nullptr) + 1;
+}
+
+float computeConsistencyExcludingBaseline(const std::vector<FrameHash>& hashes,
+                                          HashMatchFn matches)
+{
+    if (hashes.empty())
+    {
+        return 0.0f;
+    }
+    if (hashes.size() == 1u)
+    {
+        return 1.0f;
+    }
+
+    return static_cast<float>(
+               countMatchingFramesExcludingBaseline(hashes, matches, nullptr)) /
+           static_cast<float>(hashes.size() - 1u);
+}
+
 void writeHashWords(std::FILE* file, const uint32_t* words)
 {
     for (int i = 0; i < 8; ++i)
@@ -84,6 +208,23 @@ void writeHashWords(std::FILE* file, const uint32_t* words)
             std::fprintf(file, " ");
         }
     }
+}
+
+const char* combinedStatusLabel(bool colorMatch, bool depthMeasured, bool depthMatch)
+{
+    if (!depthMeasured)
+    {
+        return colorMatch ? "[CONSISTENT]" : "[DIVERGED <- 不一致]";
+    }
+    if (colorMatch && depthMatch)
+    {
+        return "[CONSISTENT]";
+    }
+    if (!colorMatch && !depthMatch)
+    {
+        return "[DIVERGED <- COLOR, DEPTH]";
+    }
+    return colorMatch ? "[DIVERGED <- DEPTH]" : "[DIVERGED <- COLOR]";
 }
 
 } // namespace
@@ -143,7 +284,8 @@ void HashProbe::init(VkDevice device,
                      VkImageView colorImageView,
                      uint32_t imageWidth,
                      uint32_t imageHeight,
-                     const char* spvPath)
+                     const char* spvPath,
+                     VkImageView depthImageView)
 {
     shutdown();
 
@@ -152,24 +294,23 @@ void HashProbe::init(VkDevice device,
     m_computeQueue = computeQueue;
     m_width = imageWidth;
     m_height = imageHeight;
+    m_depthImageView = depthImageView;
     (void)colorImageView;
 
     const std::vector<uint32_t> shaderCode = loadSpv(spvPath);
+    VkShaderModule colorShaderModule = createShaderModule(m_device, shaderCode);
 
-    VkShaderModuleCreateInfo shaderModuleInfo{};
-    shaderModuleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    shaderModuleInfo.codeSize = shaderCode.size() * sizeof(uint32_t);
-    shaderModuleInfo.pCode = shaderCode.data();
-
-    VkShaderModule shaderModule = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(m_device, &shaderModuleInfo, nullptr, &shaderModule) !=
-        VK_SUCCESS)
-    {
-        throw std::runtime_error("Failed to create HashProbe shader module.");
-    }
-
+    VkShaderModule depthShaderModule = VK_NULL_HANDLE;
     try
     {
+        if (m_depthImageView != VK_NULL_HANDLE)
+        {
+            const std::string depthSpvPath =
+                deriveSiblingSpvPath(spvPath, "sha256_depth_compute.spv");
+            const std::vector<uint32_t> depthShaderCode = loadSpv(depthSpvPath.c_str());
+            depthShaderModule = createShaderModule(m_device, depthShaderCode);
+        }
+
         VkDescriptorSetLayoutBinding imageBinding{};
         imageBinding.binding = 0;
         imageBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -216,7 +357,7 @@ void HashProbe::init(VkDevice device,
         VkPipelineShaderStageCreateInfo stageInfo{};
         stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        stageInfo.module = shaderModule;
+        stageInfo.module = colorShaderModule;
         stageInfo.pName = "main";
 
         VkComputePipelineCreateInfo pipelineInfo{};
@@ -290,38 +431,10 @@ void HashProbe::init(VkDevice device,
             throw std::runtime_error("Failed to create HashProbe input image view.");
         }
 
-        VkBufferCreateInfo bufferInfo{};
-        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        bufferInfo.size = sizeof(uint32_t) * 8u;
-        bufferInfo.usage =
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-        if (vkCreateBuffer(m_device, &bufferInfo, nullptr, &m_hashBuffer) != VK_SUCCESS)
-        {
-            throw std::runtime_error("Failed to create HashProbe hash buffer.");
-        }
-
-        VkMemoryRequirements memRequirements{};
-        vkGetBufferMemoryRequirements(m_device, m_hashBuffer, &memRequirements);
-
-        VkMemoryAllocateInfo allocInfo{};
-        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        allocInfo.allocationSize = memRequirements.size;
-        allocInfo.memoryTypeIndex = findMemoryTypeIndex(
-            physicalDevice,
-            memRequirements.memoryTypeBits,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
-        if (vkAllocateMemory(m_device, &allocInfo, nullptr, &m_hashMemory) != VK_SUCCESS)
-        {
-            throw std::runtime_error("Failed to allocate HashProbe hash memory.");
-        }
-
-        if (vkBindBufferMemory(m_device, m_hashBuffer, m_hashMemory, 0) != VK_SUCCESS)
-        {
-            throw std::runtime_error("Failed to bind HashProbe hash buffer memory.");
-        }
+        createHostVisibleHashBuffer(m_device,
+                                    physicalDevice,
+                                    m_hashBuffer,
+                                    m_hashMemory);
 
         const VkDescriptorPoolSize poolSizes[] = {
             {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
@@ -378,6 +491,168 @@ void HashProbe::init(VkDevice device,
 
         vkUpdateDescriptorSets(m_device, 2, descriptorWrites, 0, nullptr);
 
+        if (depthShaderModule != VK_NULL_HANDLE)
+        {
+            VkSamplerCreateInfo samplerInfo{};
+            samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+            samplerInfo.magFilter = VK_FILTER_NEAREST;
+            samplerInfo.minFilter = VK_FILTER_NEAREST;
+            samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+            samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            samplerInfo.maxAnisotropy = 1.0f;
+            samplerInfo.minLod = 0.0f;
+            samplerInfo.maxLod = 0.0f;
+            samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+            samplerInfo.compareEnable = VK_FALSE;
+
+            if (vkCreateSampler(m_device, &samplerInfo, nullptr, &m_depthSampler) !=
+                VK_SUCCESS)
+            {
+                throw std::runtime_error("Failed to create HashProbe depth sampler.");
+            }
+
+            VkDescriptorSetLayoutBinding depthImageBinding{};
+            depthImageBinding.binding = 0;
+            depthImageBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            depthImageBinding.descriptorCount = 1;
+            depthImageBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+            VkDescriptorSetLayoutBinding depthBufferBinding{};
+            depthBufferBinding.binding = 1;
+            depthBufferBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            depthBufferBinding.descriptorCount = 1;
+            depthBufferBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+            const VkDescriptorSetLayoutBinding depthBindings[] = {
+                depthImageBinding,
+                depthBufferBinding};
+
+            VkDescriptorSetLayoutCreateInfo depthLayoutInfo{};
+            depthLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+            depthLayoutInfo.bindingCount = 2;
+            depthLayoutInfo.pBindings = depthBindings;
+
+            if (vkCreateDescriptorSetLayout(m_device,
+                                            &depthLayoutInfo,
+                                            nullptr,
+                                            &m_depthDescriptorLayout) != VK_SUCCESS)
+            {
+                throw std::runtime_error(
+                    "Failed to create HashProbe depth descriptor set layout.");
+            }
+
+            VkPipelineLayoutCreateInfo depthPipelineLayoutInfo{};
+            depthPipelineLayoutInfo.sType =
+                VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+            depthPipelineLayoutInfo.setLayoutCount = 1;
+            depthPipelineLayoutInfo.pSetLayouts = &m_depthDescriptorLayout;
+            depthPipelineLayoutInfo.pushConstantRangeCount = 1;
+            depthPipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
+
+            if (vkCreatePipelineLayout(m_device,
+                                       &depthPipelineLayoutInfo,
+                                       nullptr,
+                                       &m_depthPipelineLayout) != VK_SUCCESS)
+            {
+                throw std::runtime_error(
+                    "Failed to create HashProbe depth pipeline layout.");
+            }
+
+            VkPipelineShaderStageCreateInfo depthStageInfo{};
+            depthStageInfo.sType =
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            depthStageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            depthStageInfo.module = depthShaderModule;
+            depthStageInfo.pName = "main";
+
+            VkComputePipelineCreateInfo depthPipelineInfo{};
+            depthPipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+            depthPipelineInfo.stage = depthStageInfo;
+            depthPipelineInfo.layout = m_depthPipelineLayout;
+
+            if (vkCreateComputePipelines(m_device,
+                                         VK_NULL_HANDLE,
+                                         1,
+                                         &depthPipelineInfo,
+                                         nullptr,
+                                         &m_depthPipeline) != VK_SUCCESS)
+            {
+                throw std::runtime_error(
+                    "Failed to create HashProbe depth compute pipeline.");
+            }
+
+            createHostVisibleHashBuffer(m_device,
+                                        physicalDevice,
+                                        m_depthHashBuffer,
+                                        m_depthHashMemory);
+
+            const VkDescriptorPoolSize depthPoolSizes[] = {
+                {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+                {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
+            };
+
+            VkDescriptorPoolCreateInfo depthPoolInfo{};
+            depthPoolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+            depthPoolInfo.maxSets = 1;
+            depthPoolInfo.poolSizeCount = 2;
+            depthPoolInfo.pPoolSizes = depthPoolSizes;
+
+            if (vkCreateDescriptorPool(m_device,
+                                       &depthPoolInfo,
+                                       nullptr,
+                                       &m_depthDescriptorPool) != VK_SUCCESS)
+            {
+                throw std::runtime_error(
+                    "Failed to create HashProbe depth descriptor pool.");
+            }
+
+            VkDescriptorSetAllocateInfo depthSetAllocInfo{};
+            depthSetAllocInfo.sType =
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            depthSetAllocInfo.descriptorPool = m_depthDescriptorPool;
+            depthSetAllocInfo.descriptorSetCount = 1;
+            depthSetAllocInfo.pSetLayouts = &m_depthDescriptorLayout;
+
+            if (vkAllocateDescriptorSets(m_device,
+                                         &depthSetAllocInfo,
+                                         &m_depthDescriptorSet) != VK_SUCCESS)
+            {
+                throw std::runtime_error(
+                    "Failed to allocate HashProbe depth descriptor set.");
+            }
+
+            VkDescriptorImageInfo depthImageInfo{};
+            depthImageInfo.sampler = m_depthSampler;
+            depthImageInfo.imageView = m_depthImageView;
+            depthImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+            VkDescriptorBufferInfo depthHashBufferInfo{};
+            depthHashBufferInfo.buffer = m_depthHashBuffer;
+            depthHashBufferInfo.offset = 0;
+            depthHashBufferInfo.range = sizeof(uint32_t) * 8u;
+
+            VkWriteDescriptorSet depthDescriptorWrites[2]{};
+            depthDescriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            depthDescriptorWrites[0].dstSet = m_depthDescriptorSet;
+            depthDescriptorWrites[0].dstBinding = 0;
+            depthDescriptorWrites[0].descriptorCount = 1;
+            depthDescriptorWrites[0].descriptorType =
+                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            depthDescriptorWrites[0].pImageInfo = &depthImageInfo;
+
+            depthDescriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            depthDescriptorWrites[1].dstSet = m_depthDescriptorSet;
+            depthDescriptorWrites[1].dstBinding = 1;
+            depthDescriptorWrites[1].descriptorCount = 1;
+            depthDescriptorWrites[1].descriptorType =
+                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            depthDescriptorWrites[1].pBufferInfo = &depthHashBufferInfo;
+
+            vkUpdateDescriptorSets(m_device, 2, depthDescriptorWrites, 0, nullptr);
+        }
+
         VkCommandBufferAllocateInfo commandAllocInfo{};
         commandAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         commandAllocInfo.commandPool = m_commandPool;
@@ -417,7 +692,8 @@ void HashProbe::init(VkDevice device,
             submitInfo.commandBufferCount = 1;
             submitInfo.pCommandBuffers = &commandBuffer;
 
-            if (vkQueueSubmit(m_computeQueue, 1, &submitInfo, VK_NULL_HANDLE) != VK_SUCCESS)
+            if (vkQueueSubmit(m_computeQueue, 1, &submitInfo, VK_NULL_HANDLE) !=
+                VK_SUCCESS)
             {
                 throw std::runtime_error("Failed to submit HashProbe init command buffer.");
             }
@@ -436,15 +712,25 @@ void HashProbe::init(VkDevice device,
     }
     catch (...)
     {
-        vkDestroyShaderModule(m_device, shaderModule, nullptr);
+        if (depthShaderModule != VK_NULL_HANDLE)
+        {
+            vkDestroyShaderModule(m_device, depthShaderModule, nullptr);
+        }
+        vkDestroyShaderModule(m_device, colorShaderModule, nullptr);
         shutdown();
         throw;
     }
 
-    vkDestroyShaderModule(m_device, shaderModule, nullptr);
+    if (depthShaderModule != VK_NULL_HANDLE)
+    {
+        vkDestroyShaderModule(m_device, depthShaderModule, nullptr);
+    }
+    vkDestroyShaderModule(m_device, colorShaderModule, nullptr);
 }
 
-FrameHash HashProbe::computeHash(VkImage colorImage, uint32_t frameIndex)
+FrameHash HashProbe::computeHash(VkImage colorImage,
+                                 uint32_t frameIndex,
+                                 VkImage depthImage)
 {
     if (!isReady())
     {
@@ -454,6 +740,10 @@ FrameHash HashProbe::computeHash(VkImage colorImage, uint32_t frameIndex)
     {
         throw std::runtime_error("HashProbe color image is null.");
     }
+
+    const bool hashDepth =
+        depthImage != VK_NULL_HANDLE && m_depthPipeline != VK_NULL_HANDLE &&
+        m_depthDescriptorSet != VK_NULL_HANDLE;
 
     VkCommandBufferAllocateInfo commandAllocInfo{};
     commandAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -483,10 +773,6 @@ FrameHash HashProbe::computeHash(VkImage colorImage, uint32_t frameIndex)
                               colorImage,
                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        transitionImageLayout(commandBuffer,
-                              m_inputImage,
-                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
         VkImageCopy copyRegion{};
         copyRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -530,26 +816,76 @@ FrameHash HashProbe::computeHash(VkImage colorImage, uint32_t frameIndex)
                            0,
                            sizeof(PushConstants),
                            &pushConstants);
-
         vkCmdDispatch(commandBuffer, 1, 1, 1);
-
-        VkMemoryBarrier hashReadyBarrier{};
-        hashReadyBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        hashReadyBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        hashReadyBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-
-        vkCmdPipelineBarrier(commandBuffer,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_HOST_BIT,
-                             0,
-                             1, &hashReadyBarrier,
-                             0, nullptr,
-                             0, nullptr);
 
         transitionImageLayout(commandBuffer,
                               m_inputImage,
                               VK_IMAGE_LAYOUT_GENERAL,
                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+        if (hashDepth)
+        {
+            transitionImageLayout(commandBuffer,
+                                  depthImage,
+                                  VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                  VK_IMAGE_ASPECT_DEPTH_BIT);
+
+            vkCmdBindPipeline(commandBuffer,
+                              VK_PIPELINE_BIND_POINT_COMPUTE,
+                              m_depthPipeline);
+            vkCmdBindDescriptorSets(commandBuffer,
+                                    VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    m_depthPipelineLayout,
+                                    0, 1, &m_depthDescriptorSet,
+                                    0, nullptr);
+            vkCmdPushConstants(commandBuffer,
+                               m_depthPipelineLayout,
+                               VK_SHADER_STAGE_COMPUTE_BIT,
+                               0,
+                               sizeof(PushConstants),
+                               &pushConstants);
+            vkCmdDispatch(commandBuffer, 1, 1, 1);
+
+            transitionImageLayout(commandBuffer,
+                                  depthImage,
+                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                  VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                                  VK_IMAGE_ASPECT_DEPTH_BIT);
+        }
+
+        VkBufferMemoryBarrier hashReadyBarriers[2]{};
+        uint32_t barrierCount = 1;
+
+        hashReadyBarriers[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        hashReadyBarriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        hashReadyBarriers[0].dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        hashReadyBarriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        hashReadyBarriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        hashReadyBarriers[0].buffer = m_hashBuffer;
+        hashReadyBarriers[0].offset = 0;
+        hashReadyBarriers[0].size = sizeof(uint32_t) * 8u;
+
+        if (hashDepth)
+        {
+            hashReadyBarriers[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            hashReadyBarriers[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            hashReadyBarriers[1].dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            hashReadyBarriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            hashReadyBarriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            hashReadyBarriers[1].buffer = m_depthHashBuffer;
+            hashReadyBarriers[1].offset = 0;
+            hashReadyBarriers[1].size = sizeof(uint32_t) * 8u;
+            barrierCount = 2;
+        }
+
+        vkCmdPipelineBarrier(commandBuffer,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_HOST_BIT,
+                             0,
+                             0, nullptr,
+                             barrierCount, hashReadyBarriers,
+                             0, nullptr);
 
         if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS)
         {
@@ -587,8 +923,28 @@ FrameHash HashProbe::computeHash(VkImage colorImage, uint32_t frameIndex)
 
     FrameHash frameHash{};
     std::memcpy(frameHash.colorHash, mappedData, sizeof(frameHash.colorHash));
+    frameHash.depthHash = 0u;
     frameHash.frameIndex = frameIndex;
     vkUnmapMemory(m_device, m_hashMemory);
+
+    if (hashDepth)
+    {
+        void* mappedDepthData = nullptr;
+        if (vkMapMemory(m_device,
+                        m_depthHashMemory,
+                        0,
+                        sizeof(uint32_t) * 8u,
+                        0,
+                        &mappedDepthData) != VK_SUCCESS)
+        {
+            throw std::runtime_error("Failed to map HashProbe depth hash memory.");
+        }
+
+        const uint32_t* depthWords =
+            static_cast<const uint32_t*>(mappedDepthData);
+        frameHash.depthHash = depthWords[7];
+        vkUnmapMemory(m_device, m_depthHashMemory);
+    }
 
     return frameHash;
 }
@@ -615,94 +971,104 @@ float HashProbe::analyzeConsistency(const std::vector<FrameHash>& hashes,
         throw std::runtime_error("Failed to open sha256 log file.");
     }
 
+    const bool depthMeasured = hasDepthHashes(hashes);
     const FrameHash& baseline = hashes.front();
+
     std::fprintf(file, "[Frame %06u] Color SHA256: ", baseline.frameIndex);
     writeHashWords(file, baseline.colorHash);
+    if (depthMeasured)
+    {
+        std::fprintf(file, "  Depth SHA256-32: %08X", baseline.depthHash);
+    }
     std::fprintf(file, "\n");
 
-    int consistentCount = 0;
     for (size_t i = 1; i < hashes.size(); ++i)
     {
-        const bool consistent = hashesMatch(baseline, hashes[i]);
-        if (consistent)
-        {
-            ++consistentCount;
-        }
+        const bool colorMatch = colorHashesMatch(baseline, hashes[i]);
+        const bool depthMatch = !depthMeasured || depthHashesMatch(baseline, hashes[i]);
 
         std::fprintf(file, "[Frame %06u] Color SHA256: ", hashes[i].frameIndex);
         writeHashWords(file, hashes[i].colorHash);
+        if (depthMeasured)
+        {
+            std::fprintf(file, "  Depth SHA256-32: %08X", hashes[i].depthHash);
+        }
         std::fprintf(file,
-                     consistent ? " [CONSISTENT]\n"
-                                : " [DIVERGED <- \xE4\xB8\x8D\xE4\xB8\x80\xE8\x87\xB4]\n");
+                     " %s\n",
+                     combinedStatusLabel(colorMatch, depthMeasured, depthMatch));
     }
 
     std::fclose(file);
 
-    if (hashes.size() == 1)
+    const float colorConsistency =
+        computeConsistencyExcludingBaseline(hashes, colorHashesMatch);
+    if (!depthMeasured)
     {
-        return 1.0f;
+        return colorConsistency;
     }
 
-    return static_cast<float>(consistentCount) /
-           static_cast<float>(hashes.size() - 1u);
+    const float depthConsistency =
+        computeConsistencyExcludingBaseline(hashes, depthHashesMatch);
+    return (colorConsistency < depthConsistency) ? colorConsistency : depthConsistency;
 }
 
 void HashProbe::generateRootCauseReport(const std::vector<FrameHash>& hashes,
                                         const char* reportPath) const
 {
-    const int matchingAfterBaseline = countMatchingFramesExcludingBaseline(hashes, nullptr);
+    // TODO(v1.2): after 3DGS alpha blending lands, extend rootcause to
+    //             report specific atomicAdd call sites in alpha_composite.comp
     const int totalFrames = static_cast<int>(hashes.size());
-    const int consistentFrames =
-        totalFrames == 0 ? 0 : matchingAfterBaseline + 1;
-    const int divergedFramesCount =
-        totalFrames == 0 ? 0 : totalFrames - consistentFrames;
-    const float consistencyRate = (totalFrames <= 1)
-        ? (totalFrames == 0 ? 0.0f : 1.0f)
-        : static_cast<float>(matchingAfterBaseline) /
-              static_cast<float>(totalFrames - 1);
+    const bool depthMeasured = hasDepthHashes(hashes);
 
-    std::vector<uint32_t> divergedFrames;
-    countMatchingFramesExcludingBaseline(hashes, &divergedFrames);
+    const int colorConsistentFrames =
+        countMatchingFramesIncludingBaseline(hashes, colorHashesMatch);
+    const int depthConsistentFrames = depthMeasured
+        ? countMatchingFramesIncludingBaseline(hashes, depthHashesMatch)
+        : 0;
 
-    const char* diagnosis = nullptr;
-    const char* nextStep1 = nullptr;
-    const char* nextStep2 = nullptr;
+    std::vector<uint32_t> colorDivergedFrames;
+    std::vector<uint32_t> depthDivergedFrames;
+    countMatchingFramesExcludingBaseline(hashes,
+                                         colorHashesMatch,
+                                         &colorDivergedFrames);
+    if (depthMeasured)
+    {
+        countMatchingFramesExcludingBaseline(hashes,
+                                             depthHashesMatch,
+                                             &depthDivergedFrames);
+    }
 
-    if (consistencyRate == 1.0f)
+    const float colorConsistency = totalFrames == 0
+        ? 0.0f
+        : (100.0f * static_cast<float>(colorConsistentFrames) /
+           static_cast<float>(totalFrames));
+    const float depthConsistency = (!depthMeasured || totalFrames == 0)
+        ? 0.0f
+        : (100.0f * static_cast<float>(depthConsistentFrames) /
+           static_cast<float>(totalFrames));
+
+    const char* conclusionState = "pass";
+    const char* conclusionDetail =
+        "point-sprite path is bit-stable for the measured tensors.";
+
+    if (totalFrames == 0)
     {
-        diagnosis =
-            "- 一致率 == 100%：当前渲染路径无可观测非确定性（可能已是确定性路径）";
-        nextStep1 =
-            "- 核对当前活动图形管线仍指向 shaders/point.vert 和 shaders/point.frag，确认未绕开并行路径。";
-        nextStep2 =
-            "- 接入真实 3DGS splat shader 后重复 100 帧采样，确认该结果不是由简化渲染路径造成。";
+        conclusionState = "fail";
+        conclusionDetail = "no frames were captured; the measurement is invalid.";
     }
-    else if (consistencyRate >= 0.9f)
+    else if (colorConsistentFrames == 0 ||
+             (depthMeasured && depthConsistentFrames == 0))
     {
-        diagnosis =
-            "- 一致率 90~99%：低频非确定性，疑似 Driver 调度（P3类）";
-        nextStep1 =
-            "- 对比 offscreen hash 与 swapchain readback，优先排查 main.cpp 中 render-pass 后的 copy/present 路径。";
-        nextStep2 =
-            "- 启用 VK_EXT_pipeline_statistics_query 并记录同一 workload 的 dispatch/draw 统计，观察 driver-level 抖动。";
+        conclusionState = "fail";
+        conclusionDetail =
+            "at least one measured tensor diverged on every sampled frame.";
     }
-    else if (consistencyRate >= 0.5f)
+    else if (colorConsistentFrames != totalFrames ||
+             (depthMeasured && depthConsistentFrames != totalFrames))
     {
-        diagnosis =
-            "- 一致率 50~89%：中频非确定性，疑似排序不稳定（P2类）";
-        nextStep1 =
-            "- 审查 GPU 排序 shader 的 equal-key 处理，确认相同深度 key 不会因并行调度改变顺序。";
-        nextStep2 =
-            "- 对高斯密集区域单独采样，并将排序输出做逐帧 hash，分离排序阶段与混合阶段的漂移。";
-    }
-    else
-    {
-        diagnosis =
-            "- 一致率 < 50%：高频非确定性，疑似 atomicAdd 浮点累加（P1类）";
-        nextStep1 =
-            "- 优先排查 fragment/compute 混合 shader 中的跨线程浮点累加点，确认是否存在 atomicAdd 或 shared reduction。";
-        nextStep2 =
-            "- 当前仓库活动片段着色器 shaders/point.frag 不含原子操作；若接入 3DGS 路径后出现高频漂移，应先锁定 splat blending shader。";
+        conclusionState = "warn";
+        conclusionDetail =
+            "the current point-sprite path shows drift in at least one measured tensor.";
     }
 
     std::FILE* file = nullptr;
@@ -719,33 +1085,98 @@ void HashProbe::generateRootCauseReport(const std::vector<FrameHash>& hashes,
         throw std::runtime_error("Failed to open sha256 root-cause report file.");
     }
 
-    std::fprintf(file, "# SHA-256 确定性分析报告\n");
-    std::fprintf(file, "## 统计摘要\n");
-    std::fprintf(file, "- 测试帧数：%d\n", totalFrames);
-    std::fprintf(file, "- 一致帧数：%d\n", consistentFrames);
-    std::fprintf(file, "- 不一致帧数：%d\n", divergedFramesCount);
-    std::fprintf(file, "- 哈希一致率：%.2f%%\n\n", consistencyRate * 100.0f);
+    std::fprintf(file, "# SHA-256 Determinism Analysis Report\n\n");
 
-    std::fprintf(file, "## 不一致帧分布\n");
-    if (divergedFrames.empty())
+    std::fprintf(file, "## Known Non-Determinism Sources (point-sprite path)\n");
+    std::fprintf(file,
+                 "- NONE: current path uses no atomicAdd, no cross-warp reduction.\n");
+    std::fprintf(file,
+                 "- Shader: shaders/point.vert:14-18 - per-vertex transform only; no shared or global accumulation.\n");
+    std::fprintf(file,
+                 "- Shader: shaders/point.frag:6-14 - single outColor write at line 13, no parallel accumulation, no atomicAdd, no imageStore.\n");
+    std::fprintf(file,
+                 "- Determinism guarantee: valid ONLY for point-sprite pipeline.\n\n");
+
+    std::fprintf(file, "## Expected Non-Determinism Sources (future 3DGS path)\n");
+    std::fprintf(file,
+                 "- shaders/alpha_composite.comp: line N/A (planned, not yet implemented)\n");
+    std::fprintf(file,
+                 "  Risk: atomicAdd on RGB accumulator across warps\n");
+    std::fprintf(file,
+                 "  -> floatNonAssociativity, see IEEE 754 sec. 5.9\n");
+    std::fprintf(file,
+                 "- shaders/radix_sort.comp: line N/A (planned, not yet implemented)\n");
+    std::fprintf(file,
+                 "  Risk: tie-breaking undefined for equal depth keys\n");
+    std::fprintf(file,
+                 "  -> GaussianData.id must be used as tiebreaker\n\n");
+
+    std::fprintf(file, "## Measurement result\n");
+    // TODO(v1.2): upgrade depth reporting from lower-32-bit summary to the
+    //             full 256-bit digest once the 3DGS depth tensor is finalized.
+    std::fprintf(file,
+                 "- colorConsistency: %.2f%% (%d/%d frames identical)\n",
+                 colorConsistency,
+                 colorConsistentFrames,
+                 totalFrames);
+    if (depthMeasured)
     {
-        std::fprintf(file, "无\n\n");
+        std::fprintf(file,
+                     "- depthConsistency: %.2f%% (%d/%d frames identical)\n",
+                     depthConsistency,
+                     depthConsistentFrames,
+                     totalFrames);
     }
     else
     {
-        for (uint32_t frame : divergedFrames)
+        std::fprintf(file,
+                     "- depthConsistency: N/A (depth hash disabled or not supplied)\n");
+    }
+
+    std::fprintf(file, "- colorDivergedFrames: ");
+    if (colorDivergedFrames.empty())
+    {
+        std::fprintf(file, "none\n");
+    }
+    else
+    {
+        for (size_t i = 0; i < colorDivergedFrames.size(); ++i)
         {
-            std::fprintf(file, "- Frame %06u\n", frame);
+            std::fprintf(file,
+                         "%s%06u",
+                         (i == 0) ? "" : ", ",
+                         colorDivergedFrames[i]);
         }
         std::fprintf(file, "\n");
     }
 
-    std::fprintf(file, "## 初步根因判断\n");
-    std::fprintf(file, "%s\n\n", diagnosis);
+    std::fprintf(file, "- depthDivergedFrames: ");
+    if (!depthMeasured)
+    {
+        std::fprintf(file, "N/A\n");
+    }
+    else if (depthDivergedFrames.empty())
+    {
+        std::fprintf(file, "none\n");
+    }
+    else
+    {
+        for (size_t i = 0; i < depthDivergedFrames.size(); ++i)
+        {
+            std::fprintf(file,
+                         "%s%06u",
+                         (i == 0) ? "" : ", ",
+                         depthDivergedFrames[i]);
+        }
+        std::fprintf(file, "\n");
+    }
 
-    std::fprintf(file, "## 下一步行动\n");
-    std::fprintf(file, "%s\n", nextStep1);
-    std::fprintf(file, "%s\n", nextStep2);
+    std::fprintf(file,
+                 "- Conclusion: %s - %s\n\n",
+                 conclusionState,
+                 conclusionDetail);
+    std::fprintf(file,
+                 "Rerun required after: v1.2 (alpha blending), v2.0 (GPU radix sort)\n");
 
     std::fclose(file);
 }
@@ -753,7 +1184,8 @@ void HashProbe::generateRootCauseReport(const std::vector<FrameHash>& hashes,
 void HashProbe::transitionImageLayout(VkCommandBuffer cmd,
                                       VkImage image,
                                       VkImageLayout oldLayout,
-                                      VkImageLayout newLayout)
+                                      VkImageLayout newLayout,
+                                      VkImageAspectFlags aspectMask)
 {
     if (oldLayout == newLayout)
     {
@@ -767,7 +1199,7 @@ void HashProbe::transitionImageLayout(VkCommandBuffer cmd,
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = image;
-    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.aspectMask = aspectMask;
     barrier.subresourceRange.baseMipLevel = 0;
     barrier.subresourceRange.levelCount = 1;
     barrier.subresourceRange.baseArrayLayer = 0;
@@ -777,24 +1209,17 @@ void HashProbe::transitionImageLayout(VkCommandBuffer cmd,
     VkPipelineStageFlags destinationStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
 
     if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED &&
-        newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+        newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL &&
+        aspectMask == VK_IMAGE_ASPECT_COLOR_BIT)
     {
         barrier.srcAccessMask = 0;
         barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
         destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
     }
-    else if (oldLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL &&
-        newLayout == VK_IMAGE_LAYOUT_GENERAL)
-    {
-        barrier.srcAccessMask =
-            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        sourceStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        destinationStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-    }
     else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL &&
-             newLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+             newLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL &&
+             aspectMask == VK_IMAGE_ASPECT_COLOR_BIT)
     {
         barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -802,7 +1227,8 @@ void HashProbe::transitionImageLayout(VkCommandBuffer cmd,
         destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
     }
     else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL &&
-             newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+             newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL &&
+             aspectMask == VK_IMAGE_ASPECT_COLOR_BIT)
     {
         barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -810,7 +1236,8 @@ void HashProbe::transitionImageLayout(VkCommandBuffer cmd,
         destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
     }
     else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL &&
-             newLayout == VK_IMAGE_LAYOUT_GENERAL)
+             newLayout == VK_IMAGE_LAYOUT_GENERAL &&
+             aspectMask == VK_IMAGE_ASPECT_COLOR_BIT)
     {
         barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -818,7 +1245,27 @@ void HashProbe::transitionImageLayout(VkCommandBuffer cmd,
         destinationStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
     }
     else if (oldLayout == VK_IMAGE_LAYOUT_GENERAL &&
-             newLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+             newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL &&
+             aspectMask == VK_IMAGE_ASPECT_COLOR_BIT)
+    {
+        barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        sourceStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    }
+    else if (oldLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL &&
+             newLayout == VK_IMAGE_LAYOUT_GENERAL &&
+             aspectMask == VK_IMAGE_ASPECT_COLOR_BIT)
+    {
+        barrier.srcAccessMask =
+            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        sourceStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        destinationStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    }
+    else if (oldLayout == VK_IMAGE_LAYOUT_GENERAL &&
+             newLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL &&
+             aspectMask == VK_IMAGE_ASPECT_COLOR_BIT)
     {
         barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
         barrier.dstAccessMask =
@@ -826,13 +1273,29 @@ void HashProbe::transitionImageLayout(VkCommandBuffer cmd,
         sourceStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
         destinationStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     }
-    else if (oldLayout == VK_IMAGE_LAYOUT_GENERAL &&
-             newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+    else if (oldLayout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL &&
+             newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL &&
+             aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT)
+    {
+        barrier.srcAccessMask =
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        sourceStage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                      VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        destinationStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    }
+    else if (oldLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL &&
+             newLayout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL &&
+             aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT)
     {
         barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask =
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
         sourceStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-        destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        destinationStage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                           VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
     }
     else
     {
@@ -855,6 +1318,21 @@ void HashProbe::shutdown()
         return;
     }
 
+    if (m_depthHashMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(m_device, m_depthHashMemory, nullptr);
+        m_depthHashMemory = VK_NULL_HANDLE;
+    }
+    if (m_depthHashBuffer != VK_NULL_HANDLE)
+    {
+        vkDestroyBuffer(m_device, m_depthHashBuffer, nullptr);
+        m_depthHashBuffer = VK_NULL_HANDLE;
+    }
+    if (m_depthSampler != VK_NULL_HANDLE)
+    {
+        vkDestroySampler(m_device, m_depthSampler, nullptr);
+        m_depthSampler = VK_NULL_HANDLE;
+    }
     if (m_hashMemory != VK_NULL_HANDLE)
     {
         vkFreeMemory(m_device, m_hashMemory, nullptr);
@@ -880,21 +1358,42 @@ void HashProbe::shutdown()
         vkDestroyImage(m_device, m_inputImage, nullptr);
         m_inputImage = VK_NULL_HANDLE;
     }
+    if (m_depthDescriptorPool != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorPool(m_device, m_depthDescriptorPool, nullptr);
+        m_depthDescriptorPool = VK_NULL_HANDLE;
+    }
+    m_depthDescriptorSet = VK_NULL_HANDLE;
     if (m_descriptorPool != VK_NULL_HANDLE)
     {
         vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
         m_descriptorPool = VK_NULL_HANDLE;
     }
     m_descriptorSet = VK_NULL_HANDLE;
+    if (m_depthPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(m_device, m_depthPipeline, nullptr);
+        m_depthPipeline = VK_NULL_HANDLE;
+    }
     if (m_pipeline != VK_NULL_HANDLE)
     {
         vkDestroyPipeline(m_device, m_pipeline, nullptr);
         m_pipeline = VK_NULL_HANDLE;
     }
+    if (m_depthPipelineLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyPipelineLayout(m_device, m_depthPipelineLayout, nullptr);
+        m_depthPipelineLayout = VK_NULL_HANDLE;
+    }
     if (m_pipelineLayout != VK_NULL_HANDLE)
     {
         vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
         m_pipelineLayout = VK_NULL_HANDLE;
+    }
+    if (m_depthDescriptorLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorSetLayout(m_device, m_depthDescriptorLayout, nullptr);
+        m_depthDescriptorLayout = VK_NULL_HANDLE;
     }
     if (m_descriptorLayout != VK_NULL_HANDLE)
     {
@@ -902,6 +1401,7 @@ void HashProbe::shutdown()
         m_descriptorLayout = VK_NULL_HANDLE;
     }
 
+    m_depthImageView = VK_NULL_HANDLE;
     m_height = 0;
     m_width = 0;
     m_commandPool = VK_NULL_HANDLE;

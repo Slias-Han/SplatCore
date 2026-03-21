@@ -7,6 +7,7 @@
 #include "../../src/tests/HashProbe.h"
 
 #define SPLATCORE_NO_ENTRYPOINT
+// TODO(P1): same as test_vram_poison.cpp - depends on engine core extraction
 #include "../../main.cpp"
 
 namespace {
@@ -27,6 +28,19 @@ bool fileExists(const char* path)
 {
     std::ifstream file(path, std::ios::binary);
     return file.good();
+}
+
+bool fileContains(const char* path, const char* needle)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file.good())
+    {
+        return false;
+    }
+
+    std::string contents((std::istreambuf_iterator<char>(file)),
+                         std::istreambuf_iterator<char>());
+    return contents.find(needle) != std::string::npos;
 }
 
 } // namespace
@@ -68,6 +82,26 @@ int main(int argc, char* argv[])
         if (!fileExists("sha256_rootcause.md"))
         {
             std::printf("[FAIL] 未生成 sha256_rootcause.md\n");
+            app.shutdownForTesting();
+            return 1;
+        }
+        if (!fileContains("sha256_rootcause.md",
+                          "Known Non-Determinism Sources"))
+        {
+            std::printf("[FAIL] 根因报告缺少 Known Non-Determinism Sources section\n");
+            app.shutdownForTesting();
+            return 1;
+        }
+        if (!fileContains("sha256_rootcause.md",
+                          "Expected Non-Determinism Sources"))
+        {
+            std::printf("[FAIL] 根因报告缺少 Expected Non-Determinism Sources section\n");
+            app.shutdownForTesting();
+            return 1;
+        }
+        if (!fileContains("sha256_rootcause.md", "depthConsistency:"))
+        {
+            std::printf("[FAIL] 根因报告缺少 depthConsistency 行\n");
             app.shutdownForTesting();
             return 1;
         }

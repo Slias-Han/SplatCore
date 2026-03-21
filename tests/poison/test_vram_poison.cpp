@@ -8,6 +8,8 @@
 #include "../../src/tests/PoisonTestHarness.h"
 
 #define SPLATCORE_NO_ENTRYPOINT
+// TODO(P1): decouple test from main.cpp - extract SplatCoreApp engine core
+//            into a linkable static lib. See docs/REFACTOR_PLAN.md
 #include "../../main.cpp"
 
 namespace {

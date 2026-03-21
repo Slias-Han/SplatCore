@@ -10,6 +10,7 @@ namespace SplatCore {
 
 struct FrameHash {
     uint32_t colorHash[8];   // SHA-256 of color tensor (8 x uint32_t)
+    uint32_t depthHash;      // SHA-256 of depth buffer, lower 32 bits
     uint32_t frameIndex;
 };
 
@@ -24,12 +25,15 @@ public:
               VkImageView colorImageView,
               uint32_t imageWidth,
               uint32_t imageHeight,
-              const char* spvPath = "shaders/sha256_compute.spv");
+              const char* spvPath = "shaders/sha256_compute.spv",
+              VkImageView depthImageView = VK_NULL_HANDLE);
 
     // Call after each rendered frame: dispatch SHA-256, read back the hash,
     // and append it to the caller-owned history.
     // Before calling, colorImage must be transitionable to VK_IMAGE_LAYOUT_GENERAL.
-    FrameHash computeHash(VkImage colorImage, uint32_t frameIndex);
+    FrameHash computeHash(VkImage colorImage,
+                          uint32_t frameIndex,
+                          VkImage depthImage = VK_NULL_HANDLE);
 
     // Write the full hash sequence to a file and return the consistency ratio
     // (0.0~1.0). If the first frame hash matches all subsequent frames,
@@ -53,11 +57,20 @@ private:
     VkPipeline m_pipeline = VK_NULL_HANDLE;
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
     VkDescriptorSet m_descriptorSet = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_depthDescriptorLayout = VK_NULL_HANDLE;
+    VkPipelineLayout m_depthPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_depthPipeline = VK_NULL_HANDLE;
+    VkDescriptorPool m_depthDescriptorPool = VK_NULL_HANDLE;
+    VkDescriptorSet m_depthDescriptorSet = VK_NULL_HANDLE;
+    VkSampler m_depthSampler = VK_NULL_HANDLE;
+    VkImageView m_depthImageView = VK_NULL_HANDLE; // Non-owning.
     VkImage m_inputImage = VK_NULL_HANDLE;
     VkDeviceMemory m_inputMemory = VK_NULL_HANDLE;
     VkImageView m_inputImageView = VK_NULL_HANDLE;
     VkBuffer m_hashBuffer = VK_NULL_HANDLE;
     VkDeviceMemory m_hashMemory = VK_NULL_HANDLE;
+    VkBuffer m_depthHashBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory m_depthHashMemory = VK_NULL_HANDLE;
     uint32_t m_width = 0;
     uint32_t m_height = 0;
 
@@ -65,7 +78,9 @@ private:
     void transitionImageLayout(VkCommandBuffer cmd,
                                VkImage image,
                                VkImageLayout oldLayout,
-                               VkImageLayout newLayout);
+                               VkImageLayout newLayout,
+                               VkImageAspectFlags aspectMask =
+                                   VK_IMAGE_ASPECT_COLOR_BIT);
 };
 
 } // namespace SplatCore

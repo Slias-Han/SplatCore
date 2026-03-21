@@ -1,16 +1,24 @@
-# SHA-256 确定性分析报告
-## 统计摘要
-- 测试帧数：100
-- 一致帧数：100
-- 不一致帧数：0
-- 哈希一致率：100.00%
+# SHA-256 Determinism Analysis Report
 
-## 不一致帧分布
-无
+## Known Non-Determinism Sources (point-sprite path)
+- NONE: current path uses no atomicAdd, no cross-warp reduction.
+- Shader: shaders/point.vert:14-18 - per-vertex transform only; no shared or global accumulation.
+- Shader: shaders/point.frag:6-14 - single outColor write at line 13, no parallel accumulation, no atomicAdd, no imageStore.
+- Determinism guarantee: valid ONLY for point-sprite pipeline.
 
-## 初步根因判断
-- 一致率 == 100%：当前渲染路径无可观测非确定性（可能已是确定性路径）
+## Expected Non-Determinism Sources (future 3DGS path)
+- shaders/alpha_composite.comp: line N/A (planned, not yet implemented)
+  Risk: atomicAdd on RGB accumulator across warps
+  -> floatNonAssociativity, see IEEE 754 sec. 5.9
+- shaders/radix_sort.comp: line N/A (planned, not yet implemented)
+  Risk: tie-breaking undefined for equal depth keys
+  -> GaussianData.id must be used as tiebreaker
 
-## 下一步行动
-- 核对当前活动图形管线仍指向 shaders/point.vert 和 shaders/point.frag，确认未绕开并行路径。
-- 接入真实 3DGS splat shader 后重复 100 帧采样，确认该结果不是由简化渲染路径造成。
+## Measurement result
+- colorConsistency: 100.00% (100/100 frames identical)
+- depthConsistency: 100.00% (100/100 frames identical)
+- colorDivergedFrames: none
+- depthDivergedFrames: none
+- Conclusion: pass - point-sprite path is bit-stable for the measured tensors.
+
+Rerun required after: v1.2 (alpha blending), v2.0 (GPU radix sort)

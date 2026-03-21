@@ -50,6 +50,9 @@ cmake --build build --config Release --target SplatCore_Shaders
 
 Run the engine with a `.ply` scene:
 
+> **Note**: Large scene files (>50 MB) are not tracked in git.
+> Place them under `tests/assets/` locally.
+
 ```powershell
 .\build\SplatCore_SilasHan.exe .\tests\assets\poison_test_scene.ply
 ```
@@ -133,6 +136,7 @@ Current conclusion:
 The GitHub Actions workflow is:
 
 - [.github/workflows/vram_poison_ci.yml](/d:/GitHubProjects/SplatCore_SilasHan/.github/workflows/vram_poison_ci.yml)
+- [.github/workflows/build_check.yml](/d:/GitHubProjects/SplatCore_SilasHan/.github/workflows/build_check.yml)
 
 It currently builds and runs:
 
@@ -144,6 +148,20 @@ It also uploads SHA-256 artifacts on every run:
 
 - `build/sha256_log.txt`
 - `build/sha256_rootcause.md`
+
+Recent Linux CI hardening on `ubuntu-22.04`:
+
+- replaced the broken `apt install glslc` path with LunarG Vulkan SDK packages so shader compilation works reliably in GitHub-hosted runners
+- added Linux platform guards in CMake and kept Win32-only logic behind `if(WIN32)` so `Configure CMake` and Linux builds no longer trip on MSVC-specific settings
+- switched Linux Vulkan surface defines to `VK_USE_PLATFORM_XLIB_KHR` and added `libx11-dev`
+- wrapped the runtime Vulkan tests with `xvfb-run -a`, because `llvmpipe` alone is not enough for GLFW/swapchain-based tests in headless CI
+
+Current CI baseline:
+
+- `Build Check` passes on Ubuntu 22.04
+- `VRAM Poison Test (M1 Gate)` passes on Ubuntu 22.04 with `llvmpipe + xvfb`
+- `SplatCore_PoisonTests`: `4/4 PASS`
+- `SplatCore_SHA256Tests`: passes and uploads `sha256_log.txt` / `sha256_rootcause.md`
 
 ## Changelog
 

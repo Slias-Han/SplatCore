@@ -556,7 +556,8 @@ void SplatCoreApp::initRenderResources()
                        offscreenImageView,
                        swapChainExtent.width,
                        swapChainExtent.height,
-                       hashProbeShaderPath.c_str());
+                       hashProbeShaderPath.c_str(),
+                       depthImageView);
         hashProbeEnabled = true;
         frameHashes.clear();
         frameHashes.reserve(100);
@@ -644,7 +645,8 @@ void SplatCoreApp::recreateSwapChain()
                        offscreenImageView,
                        swapChainExtent.width,
                        swapChainExtent.height,
-                       hashProbeShaderPath.c_str());
+                       hashProbeShaderPath.c_str(),
+                       depthImageView);
         frameHashes.clear();
         frameHashes.reserve(100);
     }
@@ -939,7 +941,7 @@ void SplatCoreApp::drawFrame()
 
     if (hashProbeEnabled && hashProbe.isReady())
     {
-        const auto hash = hashProbe.computeHash(offscreenImage, frameIndex);
+        const auto hash = hashProbe.computeHash(offscreenImage, frameIndex, depthImage);
         frameHashes.push_back(hash);
 
         if (frameHashes.size() >= 100)
@@ -1286,7 +1288,7 @@ void SplatCoreApp::createRenderPass()
     depthAttachment.format = findDepthFormat();
     depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
     depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     depthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -1696,6 +1698,8 @@ void SplatCoreApp::recordCommandBuffer(VkCommandBuffer cmdBuffer, uint32_t image
                             0, nullptr);
 
     // Draw all points
+    // TODO(v1.2): replace with 3DGS alpha blending pipeline -
+    //             this is NOT the final 3DGS render path
     vkCmdDraw(cmdBuffer, pointCount, 1, 0, 0);
 
     vkCmdEndRenderPass(cmdBuffer);
@@ -2197,7 +2201,8 @@ VkFormat SplatCoreApp::findDepthFormat() const
          VK_FORMAT_D32_SFLOAT_S8_UINT,
          VK_FORMAT_D24_UNORM_S8_UINT},
         VK_IMAGE_TILING_OPTIMAL,
-        VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT);
+        VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
 }
 
 // ── Depth resource creation ───────────────────────────────────────────────
@@ -2207,7 +2212,8 @@ void SplatCoreApp::createDepthResources()
     createImage(swapChainExtent.width, swapChainExtent.height,
                 depthFormat,
                 VK_IMAGE_TILING_OPTIMAL,
-                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                    VK_IMAGE_USAGE_SAMPLED_BIT,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                 depthImage,
                 depthImageAllocation,

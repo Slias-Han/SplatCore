@@ -1,0 +1,106 @@
+#version 450
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D inputDepth;
+
+layout(set = 0, binding = 1) buffer HashOutput {
+    uint hashDepth[8];
+} output_hash;
+
+layout(push_constant) uniform PushConstants {
+    uint imageWidth;
+    uint imageHeight;
+    uint frameIndex;
+} pc;
+
+const uint K[64] = uint[64](
+    0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u,
+    0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
+    0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u,
+    0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
+    0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu,
+    0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
+    0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u,
+    0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
+    0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u,
+    0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
+    0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u,
+    0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
+    0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u,
+    0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
+    0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
+    0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u
+);
+
+uint rotr(uint x, uint n) { return (x >> n) | (x << (32u - n)); }
+uint ch(uint e, uint f, uint g)  { return (e & f) ^ (~e & g); }
+uint maj(uint a, uint b, uint c) { return (a & b) ^ (a & c) ^ (b & c); }
+uint sigma0(uint x) { return rotr(x,2)  ^ rotr(x,13) ^ rotr(x,22); }
+uint sigma1(uint x) { return rotr(x,6)  ^ rotr(x,11) ^ rotr(x,25); }
+uint gamma0(uint x) { return rotr(x,7)  ^ rotr(x,18) ^ (x >> 3u); }
+uint gamma1(uint x) { return rotr(x,17) ^ rotr(x,19) ^ (x >> 10u); }
+
+void sha256_block(inout uint H[8], uint W_in[16]) {
+    uint W[64];
+    for (int i = 0; i < 16; i++) W[i] = W_in[i];
+    for (int i = 16; i < 64; i++)
+        W[i] = gamma1(W[i-2]) + W[i-7] + gamma0(W[i-15]) + W[i-16];
+
+    uint a=H[0], b=H[1], c=H[2], d=H[3];
+    uint e=H[4], f=H[5], g=H[6], h=H[7];
+
+    for (int i = 0; i < 64; i++) {
+        uint T1 = h + sigma1(e) + ch(e,f,g) + K[i] + W[i];
+        uint T2 = sigma0(a) + maj(a,b,c);
+        h=g; g=f; f=e; e=d+T1;
+        d=c; c=b; b=a; a=T1+T2;
+    }
+    H[0]+=a; H[1]+=b; H[2]+=c; H[3]+=d;
+    H[4]+=e; H[5]+=f; H[6]+=g; H[7]+=h;
+}
+
+void main() {
+    uint H[8] = uint[8](
+        0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+        0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u
+    );
+
+    uint totalPixels = pc.imageWidth * pc.imageHeight;
+    uint byteLen = totalPixels * 4u;
+    uint blockCount = (byteLen + 9u + 63u) / 64u;
+
+    for (uint b = 0u; b < blockCount; b++) {
+        uint W_in[16];
+        for (int w = 0; w < 16; w++) {
+            uint word = 0u;
+            for (int byte_i = 0; byte_i < 4; byte_i++) {
+                uint globalByte = b * 64u + uint(w) * 4u + uint(byte_i);
+                uint val = 0u;
+                if (globalByte < byteLen) {
+                    uint pIdx = globalByte / 4u;
+                    uint bOff = globalByte % 4u;
+                    uint px = pIdx % pc.imageWidth;
+                    uint py = pIdx / pc.imageWidth;
+                    float depth = texelFetch(inputDepth, ivec2(px, py), 0).r;
+                    uint depthBits = floatBitsToUint(depth);
+                    val = (depthBits >> ((3u - bOff) * 8u)) & 0xFFu;
+                } else if (globalByte == byteLen) {
+                    val = 0x80u;
+                } else if (globalByte >= (blockCount * 64u - 8u)) {
+                    uint bitLen = byteLen * 8u;
+                    uint lenByteIdx = globalByte - (blockCount * 64u - 8u);
+                    val = (lenByteIdx >= 4u)
+                        ? uint((bitLen >> ((7u - lenByteIdx) * 8u)) & 0xFFu)
+                        : 0u;
+                }
+                word = (word << 8u) | val;
+            }
+            W_in[w] = word;
+        }
+        sha256_block(H, W_in);
+    }
+
+    for (int i = 0; i < 8; i++)
+        output_hash.hashDepth[i] = H[i];
+}
