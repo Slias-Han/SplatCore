@@ -28,10 +28,15 @@ jobs:
           https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends \
+          libvulkan1 \
+          libvulkan-dev \
           vulkan-sdk \
           mesa-vulkan-drivers \
+          vulkan-tools \
+          glslang-tools \
           libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
           libglfw3-dev \
+          libglm-dev \
           cmake ninja-build
 
     - name: Force llvmpipe (no GPU required)
