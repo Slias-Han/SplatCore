@@ -106,6 +106,26 @@ jobs:
           ./shaders
       timeout-minutes: 10
 
+    - name: Build PcieTests
+      run: cmake --build build --config Release --target SplatCore_PcieTests
+
+    - name: Run PcieTests
+      env:
+        PCIE_TEST_FRAMES: "50"
+      run: |
+        cd build
+        xvfb-run -a ./SplatCore_PcieTests \
+          ../tests/assets/fragment.ply \
+          ./shaders
+      timeout-minutes: 10
+
+    - name: Upload PCIe baseline report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: pcie-baseline-report-${{ github.run_id }}
+        path: build/pcie_baseline_report.md
+
     - name: Upload epsilon report
       if: always()
       uses: actions/upload-artifact@v4

@@ -26,6 +26,7 @@
 #include "src/core/memory/MemorySystem.h"
 #include "src/core/memory/VramLogger.h"
 #include "src/tests/HashProbe.h"
+#include "src/tests/PcieTransferTracker.h"
 
 using SplatCore::Allocation;
 using SplatCore::AllocationDesc;
@@ -460,6 +461,8 @@ void SplatCoreApp::renderDepthForTesting(const glm::mat4& view,
                                          std::vector<float>& outDepth)
 {
     testViewOverride = view;
+    const TransferPhase previousPhase =
+        PcieTransferTracker::instance().currentPhase();
     try
     {
         if (window != nullptr)
@@ -472,11 +475,14 @@ void SplatCoreApp::renderDepthForTesting(const glm::mat4& view,
         {
             throw std::runtime_error("vkDeviceWaitIdle failed before depth readback.");
         }
+        PcieTransferTracker::instance().setPhase(TransferPhase::TEST_ONLY);
         readbackDepthFrame(outDepth);
+        PcieTransferTracker::instance().setPhase(previousPhase);
         failIfValidationIssueDetected();
     }
     catch (...)
     {
+        PcieTransferTracker::instance().setPhase(previousPhase);
         testViewOverride.reset();
         throw;
     }
@@ -490,7 +496,19 @@ void SplatCoreApp::readbackOffscreenForTesting(std::vector<uint32_t> &outPixels)
     {
         throw std::runtime_error("vkDeviceWaitIdle failed before offscreen readback.");
     }
-    readbackOffscreenFrame(outPixels);
+    const TransferPhase previousPhase =
+        PcieTransferTracker::instance().currentPhase();
+    try
+    {
+        PcieTransferTracker::instance().setPhase(TransferPhase::TEST_ONLY);
+        readbackOffscreenFrame(outPixels);
+        PcieTransferTracker::instance().setPhase(previousPhase);
+    }
+    catch (...)
+    {
+        PcieTransferTracker::instance().setPhase(previousPhase);
+        throw;
+    }
     failIfValidationIssueDetected();
 }
 
@@ -564,6 +582,7 @@ void SplatCoreApp::initVulkanCore()
 
 void SplatCoreApp::initRenderResources()
 {
+    PCIE_SET_PHASE(INIT);
     createSwapChain();
     createImageViews();
     createDepthResources(); // depth image sized to swapchain extent
@@ -619,11 +638,13 @@ void SplatCoreApp::initRenderResources()
 
 void SplatCoreApp::mainLoop()
 {
+    PCIE_SET_PHASE(RENDER_LOOP);
     while (glfwWindowShouldClose(window) == GLFW_FALSE)
     {
         drawFrame();
     }
 
+    PCIE_SET_PHASE(INIT);
     if (vkDeviceWaitIdle(device) != VK_SUCCESS)
     {
         throw std::runtime_error("vkDeviceWaitIdle failed.");
@@ -962,6 +983,7 @@ void SplatCoreApp::resetFrameLoopStateForTesting()
 
 void SplatCoreApp::drawFrame()
 {
+    PCIE_SET_PHASE(RENDER_LOOP);
     failIfValidationIssueDetected();
 
     // 0) Delta time — camera movement is frame-rate independent.
@@ -1717,12 +1739,13 @@ void SplatCoreApp::readbackOffscreenFrame(std::vector<uint32_t> &outPixels)
         swapChainExtent.height,
         1};
 
-    vkCmdCopyImageToBuffer(commandBuffer,
-                           offscreenImage,
-                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           offscreenReadbackBuffer,
-                           1,
-                           &copyRegion);
+        vkCmdCopyImageToBuffer(commandBuffer,
+                               offscreenImage,
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               offscreenReadbackBuffer,
+                               1,
+                               &copyRegion);
+    PCIE_RECORD_D2H("poison_offscreen_color_readback", byteSize);
 
     VkBufferMemoryBarrier bufferToHost{};
     bufferToHost.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -1856,6 +1879,7 @@ void SplatCoreApp::readbackDepthFrame(std::vector<float>& outDepth)
                                stagingAllocation.buffer,
                                1,
                                &copyRegion);
+        PCIE_RECORD_D2H("epsilon_depth_readback", byteSize);
 
         VkBufferMemoryBarrier bufferToHost{};
         bufferToHost.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -2975,6 +2999,7 @@ void SplatCoreApp::loadPointCloud()
                      "GaussianRenderer::SplatVertexBuffer");
 
         copyBuffer(stagingBuf, pointVertexBuffer, bufferSize);
+        PCIE_RECORD_H2D("scene_upload_ply", bufferSize);
     }
     catch (...)
     {
@@ -3160,6 +3185,7 @@ void SplatCoreApp::updateUniformBuffer(uint32_t frameSlot)
     ubo.proj[1][1] *= -1.0f;
 
     std::memcpy(uniformBuffersMapped[frameSlot], &ubo, sizeof(ubo));
+    PCIE_RECORD_H2D("uniform_buffer_update_per_frame", sizeof(UniformBufferObject));
 }
 
 bool SplatCoreApp::checkValidationLayerSupport() const

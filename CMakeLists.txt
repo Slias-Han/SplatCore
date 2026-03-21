@@ -103,6 +103,7 @@ add_executable(SplatCore_SilasHan
     src/core/memory/MemorySystem.cpp
     src/core/memory/VramLogger.cpp
     src/tests/HashProbe.cpp
+    src/tests/PcieTransferTracker.cpp
     src/tests/PoisonTestHarness.cpp
     third_party/vma/vma_impl.cpp
 )
@@ -217,6 +218,7 @@ add_test(NAME memory_vram_lifecycle
 add_executable(SplatCore_PoisonTests
     tests/poison/test_vram_poison.cpp
     src/tests/HashProbe.cpp
+    src/tests/PcieTransferTracker.cpp
     src/tests/PoisonTestHarness.cpp
     src/core/memory/MemorySystem.cpp
     src/core/memory/VramLogger.cpp
@@ -286,6 +288,7 @@ add_test(NAME vram_poison_test
 add_executable(SplatCore_SHA256Tests
     tests/sha256/test_sha256_consistency.cpp
     src/tests/HashProbe.cpp
+    src/tests/PcieTransferTracker.cpp
     src/tests/PoisonTestHarness.cpp
     src/core/memory/MemorySystem.cpp
     src/core/memory/VramLogger.cpp
@@ -356,6 +359,7 @@ add_executable(SplatCore_EpsilonTests
     tests/epsilon/test_epsilon_invariance.cpp
     src/tests/EpsilonProbe.cpp
     src/tests/HashProbe.cpp
+    src/tests/PcieTransferTracker.cpp
     src/tests/PoisonTestHarness.cpp
     src/core/memory/MemorySystem.cpp
     src/core/memory/VramLogger.cpp
@@ -417,6 +421,76 @@ add_dependencies(SplatCore_EpsilonTests SplatCore_Shaders)
 
 add_test(NAME epsilon_invariance_test
     COMMAND SplatCore_EpsilonTests
+            "${CMAKE_SOURCE_DIR}/tests/assets/fragment.ply"
+            "${CMAKE_BINARY_DIR}/shaders"
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+)
+
+add_executable(SplatCore_PcieTests
+    tests/pcie/test_pcie_baseline.cpp
+    src/tests/PcieTransferTracker.cpp
+    src/tests/HashProbe.cpp
+    src/tests/PoisonTestHarness.cpp
+    src/core/memory/MemorySystem.cpp
+    src/core/memory/VramLogger.cpp
+    third_party/vma/vma_impl.cpp
+)
+
+target_include_directories(SplatCore_PcieTests PRIVATE
+    ${Vulkan_INCLUDE_DIRS}
+    third_party/vma
+    src
+    .
+)
+
+target_link_libraries(SplatCore_PcieTests PRIVATE
+    Vulkan::Vulkan
+    ${Vulkan_LIBRARIES}
+    glfw
+    glm::glm
+)
+
+if(MSVC)
+    target_link_libraries(SplatCore_PcieTests PRIVATE
+        $<$<CONFIG:Debug>:ucrtd.lib>
+        $<$<CONFIG:Debug>:vcruntimed.lib>
+        $<$<CONFIG:Debug>:msvcrtd.lib>
+        $<$<CONFIG:Release>:ucrt.lib>
+        $<$<CONFIG:Release>:vcruntime.lib>
+        $<$<CONFIG:Release>:msvcrt.lib>
+    )
+endif()
+
+if(WIN32)
+    target_link_libraries(SplatCore_PcieTests PRIVATE
+        kernel32.lib
+        user32.lib
+    )
+endif()
+
+target_compile_definitions(SplatCore_PcieTests PRIVATE
+    "SHADER_DIR=\"${SHADER_BIN_DIR}/\""
+    $<$<CONFIG:Debug>:VK_ENABLE_VALIDATION_LAYERS>
+)
+
+if(MSVC)
+    target_compile_options(SplatCore_PcieTests PRIVATE
+        /W4
+        $<$<CONFIG:Debug>:/Od /Zi /RTC1>
+        $<$<CONFIG:Release>:/O2 /DNDEBUG>
+    )
+else()
+    target_compile_options(SplatCore_PcieTests PRIVATE
+        -Wall -Wextra -Wpedantic
+        $<$<CONFIG:Debug>:-O0 -g>
+        $<$<CONFIG:Release>:-O2 -DNDEBUG>
+    )
+endif()
+
+add_dependencies(SplatCore_PcieTests SplatCore_Shaders)
+
+add_test(NAME pcie_baseline_test
+    COMMAND SplatCore_PcieTests
             "${CMAKE_SOURCE_DIR}/tests/assets/fragment.ply"
             "${CMAKE_BINARY_DIR}/shaders"
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"

@@ -1,4 +1,5 @@
 #include "HashProbe.h"
+#include "PcieTransferTracker.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -926,6 +927,12 @@ FrameHash HashProbe::computeHash(VkImage colorImage,
     frameHash.depthHash = 0u;
     frameHash.frameIndex = frameIndex;
     vkUnmapMemory(m_device, m_hashMemory);
+
+    const TransferPhase previousPhase =
+        PcieTransferTracker::instance().currentPhase();
+    PcieTransferTracker::instance().setPhase(TransferPhase::TEST_ONLY);
+    PCIE_RECORD_D2H("sha256_hash_readback", sizeof(uint32_t) * 8u);
+    PcieTransferTracker::instance().setPhase(previousPhase);
 
     if (hashDepth)
     {
