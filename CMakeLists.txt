@@ -100,9 +100,12 @@ add_custom_target(SplatCore_Shaders ALL DEPENDS ${SHADER_OUTPUTS})
 
 add_executable(SplatCore_SilasHan
     main.cpp
+    src/core/transform/CoordinateFrame.cpp
+    src/core/transform/TransformTree.cpp
     src/core/memory/MemorySystem.cpp
     src/core/memory/VramLogger.cpp
     src/tests/HashProbe.cpp
+    src/tests/PcieTransferTracker.cpp
     src/tests/PoisonTestHarness.cpp
     third_party/vma/vma_impl.cpp
 )
@@ -155,6 +158,24 @@ else()
 endif()
 
 enable_testing()
+
+set(SHARED_ENGINE_SOURCES
+    src/core/transform/CoordinateFrame.cpp
+    src/core/transform/TransformTree.cpp
+    src/tests/HashProbe.cpp
+    src/tests/PcieTransferTracker.cpp
+    src/tests/PoisonTestHarness.cpp
+    src/core/memory/MemorySystem.cpp
+    src/core/memory/VramLogger.cpp
+    third_party/vma/vma_impl.cpp
+)
+
+set(SHARED_ENGINE_LIBS
+    Vulkan::Vulkan
+    ${Vulkan_LIBRARIES}
+    glfw
+    glm::glm
+)
 
 add_executable(SplatCore_MemoryLifecycleTests
     tests/memory/test_vram_lifecycle.cpp
@@ -216,11 +237,7 @@ add_test(NAME memory_vram_lifecycle
 
 add_executable(SplatCore_PoisonTests
     tests/poison/test_vram_poison.cpp
-    src/tests/HashProbe.cpp
-    src/tests/PoisonTestHarness.cpp
-    src/core/memory/MemorySystem.cpp
-    src/core/memory/VramLogger.cpp
-    third_party/vma/vma_impl.cpp
+    ${SHARED_ENGINE_SOURCES}
 )
 
 target_include_directories(SplatCore_PoisonTests PRIVATE
@@ -231,10 +248,7 @@ target_include_directories(SplatCore_PoisonTests PRIVATE
 )
 
 target_link_libraries(SplatCore_PoisonTests PRIVATE
-    Vulkan::Vulkan
-    ${Vulkan_LIBRARIES}
-    glfw
-    glm::glm
+    ${SHARED_ENGINE_LIBS}
 )
 
 if(MSVC)
@@ -285,11 +299,7 @@ add_test(NAME vram_poison_test
 
 add_executable(SplatCore_SHA256Tests
     tests/sha256/test_sha256_consistency.cpp
-    src/tests/HashProbe.cpp
-    src/tests/PoisonTestHarness.cpp
-    src/core/memory/MemorySystem.cpp
-    src/core/memory/VramLogger.cpp
-    third_party/vma/vma_impl.cpp
+    ${SHARED_ENGINE_SOURCES}
 )
 
 target_include_directories(SplatCore_SHA256Tests PRIVATE
@@ -300,10 +310,7 @@ target_include_directories(SplatCore_SHA256Tests PRIVATE
 )
 
 target_link_libraries(SplatCore_SHA256Tests PRIVATE
-    Vulkan::Vulkan
-    ${Vulkan_LIBRARIES}
-    glfw
-    glm::glm
+    ${SHARED_ENGINE_LIBS}
 )
 
 if(MSVC)
@@ -349,5 +356,175 @@ add_test(NAME sha256_consistency_test
     COMMAND SplatCore_SHA256Tests
             "${CMAKE_SOURCE_DIR}/tests/assets/poison_test_scene.ply"
             "${CMAKE_BINARY_DIR}/shaders"
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+)
+
+add_executable(SplatCore_EpsilonTests
+    tests/epsilon/test_epsilon_invariance.cpp
+    src/tests/EpsilonProbe.cpp
+    ${SHARED_ENGINE_SOURCES}
+)
+
+target_include_directories(SplatCore_EpsilonTests PRIVATE
+    ${Vulkan_INCLUDE_DIRS}
+    third_party/vma
+    src
+    .
+)
+
+target_link_libraries(SplatCore_EpsilonTests PRIVATE
+    ${SHARED_ENGINE_LIBS}
+)
+
+if(MSVC)
+    target_link_libraries(SplatCore_EpsilonTests PRIVATE
+        $<$<CONFIG:Debug>:ucrtd.lib>
+        $<$<CONFIG:Debug>:vcruntimed.lib>
+        $<$<CONFIG:Debug>:msvcrtd.lib>
+        $<$<CONFIG:Release>:ucrt.lib>
+        $<$<CONFIG:Release>:vcruntime.lib>
+        $<$<CONFIG:Release>:msvcrt.lib>
+    )
+endif()
+
+if(WIN32)
+    target_link_libraries(SplatCore_EpsilonTests PRIVATE
+        kernel32.lib
+        user32.lib
+    )
+endif()
+
+target_compile_definitions(SplatCore_EpsilonTests PRIVATE
+    "SHADER_DIR=\"${SHADER_BIN_DIR}/\""
+    $<$<CONFIG:Debug>:VK_ENABLE_VALIDATION_LAYERS>
+)
+
+if(MSVC)
+    target_compile_options(SplatCore_EpsilonTests PRIVATE
+        /W4
+        $<$<CONFIG:Debug>:/Od /Zi /RTC1>
+        $<$<CONFIG:Release>:/O2 /DNDEBUG>
+    )
+else()
+    target_compile_options(SplatCore_EpsilonTests PRIVATE
+        -Wall -Wextra -Wpedantic
+        $<$<CONFIG:Debug>:-O0 -g>
+        $<$<CONFIG:Release>:-O2 -DNDEBUG>
+    )
+endif()
+
+add_dependencies(SplatCore_EpsilonTests SplatCore_Shaders)
+
+add_test(NAME epsilon_invariance_test
+    COMMAND SplatCore_EpsilonTests
+            "${CMAKE_SOURCE_DIR}/tests/assets/fragment.ply"
+            "${CMAKE_BINARY_DIR}/shaders"
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+)
+
+add_executable(SplatCore_PcieTests
+    tests/pcie/test_pcie_baseline.cpp
+    ${SHARED_ENGINE_SOURCES}
+)
+
+target_include_directories(SplatCore_PcieTests PRIVATE
+    ${Vulkan_INCLUDE_DIRS}
+    third_party/vma
+    src
+    .
+)
+
+target_link_libraries(SplatCore_PcieTests PRIVATE
+    ${SHARED_ENGINE_LIBS}
+)
+
+if(MSVC)
+    target_link_libraries(SplatCore_PcieTests PRIVATE
+        $<$<CONFIG:Debug>:ucrtd.lib>
+        $<$<CONFIG:Debug>:vcruntimed.lib>
+        $<$<CONFIG:Debug>:msvcrtd.lib>
+        $<$<CONFIG:Release>:ucrt.lib>
+        $<$<CONFIG:Release>:vcruntime.lib>
+        $<$<CONFIG:Release>:msvcrt.lib>
+    )
+endif()
+
+if(WIN32)
+    target_link_libraries(SplatCore_PcieTests PRIVATE
+        kernel32.lib
+        user32.lib
+    )
+endif()
+
+target_compile_definitions(SplatCore_PcieTests PRIVATE
+    "SHADER_DIR=\"${SHADER_BIN_DIR}/\""
+    $<$<CONFIG:Debug>:VK_ENABLE_VALIDATION_LAYERS>
+)
+
+if(MSVC)
+    target_compile_options(SplatCore_PcieTests PRIVATE
+        /W4
+        $<$<CONFIG:Debug>:/Od /Zi /RTC1>
+        $<$<CONFIG:Release>:/O2 /DNDEBUG>
+    )
+else()
+    target_compile_options(SplatCore_PcieTests PRIVATE
+        -Wall -Wextra -Wpedantic
+        $<$<CONFIG:Debug>:-O0 -g>
+        $<$<CONFIG:Release>:-O2 -DNDEBUG>
+    )
+endif()
+
+add_dependencies(SplatCore_PcieTests SplatCore_Shaders)
+
+add_test(NAME pcie_baseline_test
+    COMMAND SplatCore_PcieTests
+            "${CMAKE_SOURCE_DIR}/tests/assets/fragment.ply"
+            "${CMAKE_BINARY_DIR}/shaders"
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+)
+
+add_executable(SplatCore_TransformTests
+    tests/transform/test_transform_tree.cpp
+    src/core/transform/CoordinateFrame.cpp
+    src/core/transform/TransformTree.cpp
+)
+
+target_include_directories(SplatCore_TransformTests PRIVATE
+    src
+    .
+)
+
+target_link_libraries(SplatCore_TransformTests PRIVATE
+    glm::glm
+)
+
+if(MSVC)
+    target_link_libraries(SplatCore_TransformTests PRIVATE
+        $<$<CONFIG:Debug>:ucrtd.lib>
+        $<$<CONFIG:Debug>:vcruntimed.lib>
+        $<$<CONFIG:Debug>:msvcrtd.lib>
+        $<$<CONFIG:Release>:ucrt.lib>
+        $<$<CONFIG:Release>:vcruntime.lib>
+        $<$<CONFIG:Release>:msvcrt.lib>
+    )
+endif()
+
+if(MSVC)
+    target_compile_options(SplatCore_TransformTests PRIVATE
+        /W4
+        $<$<CONFIG:Debug>:/Od /Zi /RTC1>
+        $<$<CONFIG:Release>:/O2 /DNDEBUG>
+    )
+else()
+    target_compile_options(SplatCore_TransformTests PRIVATE
+        -Wall -Wextra -Wpedantic
+        $<$<CONFIG:Debug>:-O0 -g>
+        $<$<CONFIG:Release>:-O2 -DNDEBUG>
+    )
+endif()
+
+add_test(NAME transform_tree_test
+    COMMAND SplatCore_TransformTests
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
 )

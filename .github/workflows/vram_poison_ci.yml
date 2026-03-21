@@ -93,6 +93,54 @@ jobs:
           shaders
       timeout-minutes: 10
 
+    - name: Build EpsilonTests
+      run: cmake --build build --config Release --target SplatCore_EpsilonTests
+
+    - name: Run EpsilonTests
+      env:
+        EPSILON_TEST_POSES: "3"
+      run: |
+        cd build
+        xvfb-run -a ./SplatCore_EpsilonTests \
+          ../tests/assets/fragment.ply \
+          ./shaders
+      timeout-minutes: 10
+
+    - name: Build PcieTests
+      run: cmake --build build --config Release --target SplatCore_PcieTests
+
+    - name: Run PcieTests
+      env:
+        PCIE_TEST_FRAMES: "50"
+      run: |
+        cd build
+        xvfb-run -a ./SplatCore_PcieTests \
+          ../tests/assets/fragment.ply \
+          ./shaders
+      timeout-minutes: 10
+
+    - name: Build TransformTests
+      run: cmake --build build --config Release --target SplatCore_TransformTests
+
+    - name: Run TransformTests
+      run: ./build/SplatCore_TransformTests
+
+    - name: Upload PCIe baseline report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: pcie-baseline-report-${{ github.run_id }}
+        path: build/pcie_baseline_report.md
+
+    - name: Upload epsilon report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: epsilon-report-${{ github.run_id }}
+        path: |
+          build/epsilon_report.md
+        retention-days: 14
+
     - name: Upload SHA256 Reports
       if: always()
       uses: actions/upload-artifact@v4
@@ -101,4 +149,6 @@ jobs:
         path: |
           build/sha256_log.txt
           build/sha256_rootcause.md
+          build/epsilon_report.md
+          build/pcie_baseline_report.md
         retention-days: 14
