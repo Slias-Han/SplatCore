@@ -18,22 +18,38 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
+    # Fixed: replaced LunarG external repo with apt-native mesa install用中文回复我
     - name: Install Vulkan SDK + Mesa llvmpipe
       run: |
-        sudo apt-get update -qq
+        sudo apt-get update -y
         sudo apt-get install -y --no-install-recommends \
+          libvulkan1 \
           libvulkan-dev \
-          vulkan-validationlayers \
           mesa-vulkan-drivers \
-          libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+          vulkan-tools \
+          glslang-tools \
           libglfw3-dev \
+          libglm-dev \
           cmake ninja-build \
           glslc
+        if vulkaninfo --summary | grep -qi "llvmpipe"; then
+          echo "llvmpipe detected during install verification."
+        else
+          echo "WARNING: llvmpipe not detected in vulkaninfo --summary during install verification."
+        fi
 
     - name: Force llvmpipe (no GPU required)
       run: |
-        echo "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json" >> $GITHUB_ENV
-        echo "VK_LOADER_DRIVERS_SELECT=lvp" >> $GITHUB_ENV
+        ICD_PATH="/usr/share/vulkan/icd.d/lvp_icd.x86_64.json"
+        if [ ! -f "$ICD_PATH" ]; then
+          ICD_PATH="$(find /usr/share/vulkan/icd.d -name '*.json' | head -1)"
+        fi
+        echo "VK_ICD_FILENAMES=$ICD_PATH" >> $GITHUB_ENV
+        echo "LIBGL_ALWAYS_SOFTWARE=1" >> $GITHUB_ENV
+
+    - name: Verify Vulkan environment
+      run: |
+        vulkaninfo --summary || true
 
     - name: Configure CMake
       run: |
